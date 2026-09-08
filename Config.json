@@ -1,0 +1,39 @@
+{
+  "palette": ["#F2A93B", "#3D8B8B", "#C75146", "#7C9070", "#6E7BA8", "#B98BC9", "#D9B23D"],
+
+  "headerSynonyms": {
+    "cliente": ["cliente", "ragione sociale", "nome cliente", "tenuta", "azienda"],
+    "indirizzo": ["indirizzo", "via", "indirizzo di ritiro", "indirizzo ritiro"],
+    "cap": ["cap", "codice postale", "zip", "postal code"],
+    "localita": ["localita", "comune", "citta", "city", "location"],
+    "orario": ["orario ritiro", "orario di ritiro", "orario", "ora ritiro", "ora"],
+    "bancali": ["bancali", "pallet", "pallets", "n. bancali", "numero bancali", "n bancali"],
+    "volume": ["m3", "mc", "metri cubi", "volume", "mcubi", "m\u00b3"]
+  },
+
+  "defaults": {
+    "capacitaBancali": 33,
+    "volumeBancalePerM3": 2.1,
+    "tempoSostaMin": 20,
+    "tolleranzaRitardoMin": 15,
+    "maxGiroOre": 9,
+    "orarioPartenza": "07:00",
+    "maxMezzi": 1,
+    "rientroDeposito": true,
+    "mapCenter": { "lat": 44.4938, "lng": 11.3387 },
+    "mapZoom": 7
+  },
+
+  "endpoints": {
+    "nominatimSearch": "https://nominatim.openstreetmap.org/search",
+    "osrmTable": "https://router.project-osrm.org/table/v1/driving",
+    "osrmRoute": "https://router.project-osrm.org/route/v1/driving",
+    "osmTiles": "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+  },
+
+  "geocoding": {
+    "requestDelayMs": 1100,
+    "countryCode": "it",
+    "countryName": "Italia"
+  }
+}
