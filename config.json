@@ -6,19 +6,25 @@
     "indirizzo": ["indirizzo", "via", "indirizzo di ritiro", "indirizzo ritiro"],
     "cap": ["cap", "codice postale", "zip", "postal code"],
     "localita": ["localita", "comune", "citta", "city", "location"],
-    "orario": ["orario ritiro", "orario di ritiro", "orario", "ora ritiro", "ora"],
+    "orario": ["pronto dalle", "disponibile dalle", "orario ritiro", "orario di ritiro", "orario", "ora ritiro", "ora"],
+    "orarioEntro": ["entro le", "chiusura", "orario chiusura", "entro", "scadenza"],
+    "metriLineari": ["metri lineari", "ml", "metri lin", "pianale", "ml occupati"],
     "bancali": ["bancali", "pallet", "pallets", "n. bancali", "numero bancali", "n bancali"],
-    "volume": ["m3", "mc", "metri cubi", "volume", "mcubi", "m\u00b3"]
+    "volume": ["m3", "mc", "metri cubi", "volume", "mcubi", "m\u00b3"],
+    "nomeMezzo": ["nome", "autista", "conducente", "mezzo", "targa"],
+    "orarioPartenzaMezzo": ["orario partenza", "partenza", "orario", "inizio turno"]
   },
 
   "defaults": {
-    "capacitaBancali": 33,
+      "capacitaUtileM3": 37,
+    "capacitaLineareM": 13.6,
+    "metriLineariPerBancale": 0.4,
     "volumeBancalePerM3": 2.1,
     "tempoSostaMin": 20,
     "tolleranzaRitardoMin": 15,
     "maxGiroOre": 9,
     "orarioPartenza": "07:00",
-    "maxMezzi": 1,
+    "primoMezzoOrarioPartenza": "07:00",
     "rientroDeposito": true,
     "mapCenter": { "lat": 44.4938, "lng": 11.3387 },
     "mapZoom": 7
