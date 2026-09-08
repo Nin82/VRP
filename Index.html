@@ -1,0 +1,90 @@
+        </div>
+        <div id="depositoStatus" class="status-line"></div>
+      </section>
+ 
+      <section class="block">
+        <h2>Flotta disponibile</h2>
+        <div class="row">
+          <div class="field"><label>Mezzi disponibili (max)</label><input type="number" id="numMezzi" min="1" value="1"></div>
+          <div class="field"><label>Partenza (tutti i mezzi)</label><input type="time" id="orarioPartenza" value="07:00"></div>
+        </div>
+        <div class="status-line" style="margin-top:0;">L'app userà il minimo indispensabile fino a questo numero, in base a capacità e orari.</div>
+      </section>
+ 
+      <section class="block">
+        <h2>Ritiri <span class="count" id="ritiriCount">(0)</span></h2>
+        <div class="dropzone" id="dropzone">
+          <div><b>Trascina qui il file</b> (Excel o CSV)</div>
+          <div>oppure clicca per selezionarlo</div>
+          <div class="cols">colonne attese: Cliente · Indirizzo · CAP · Località · Orario ritiro · Bancali (oppure Metri cubi)</div>
+        </div>
+        <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" style="display:none">
+        <div class="file-summary" id="fileSummary" style="display:none;">
+          <span id="fileSummaryText"></span>
+          <button class="btn-ghost" id="clearRitiriBtn" style="border:1px solid var(--border)">svuota</button>
+        </div>
+        <div class="ritiri-scroll" id="ritiriScroll" style="display:none;"></div>
+ 
+        <div class="manual-toggle" id="manualToggle">+ aggiungi un ritiro singolo a mano</div>
+        <div class="manual-form" id="manualForm">
+          <div class="field"><label>Cliente</label><input type="text" id="mCliente"></div>
+          <div class="field"><label>Indirizzo</label><input type="text" id="mIndirizzo"></div>
+          <div class="row">
+            <div class="field"><label>CAP</label><input type="text" id="mCap"></div>
+            <div class="field"><label>Località</label><input type="text" id="mLocalita"></div>
+          </div>
+          <div class="row">
+            <div class="field"><label>Orario ritiro</label><input type="time" id="mOrario"></div>
+            <div class="field"><label>Volume (m³)</label><input type="number" step="0.1" id="mQuantita"></div>
+          </div>
+          <button class="btn-ghost" style="border:1px solid var(--border)" id="addManualBtn">+ aggiungi</button>
+        </div>
+      </section>
+ 
+      <section class="block">
+        <h2>Parametri</h2>
+        <div class="settings-row">
+          <label>Capacità per mezzo (bancali)</label>
+          <input type="number" id="capacitaBancali">
+        </div>
+        <div class="settings-row">
+          <label>Volume per bancale (m³)</label>
+          <input type="number" step="0.1" id="volumeBancale">
+        </div>
+        <div class="settings-row">
+          <label>Sosta media per ritiro (min)</label>
+          <input type="number" id="tempoSosta">
+        </div>
+        <div class="settings-row">
+          <label>Tolleranza ritardo (min)</label>
+          <input type="number" id="tolleranzaRitardo">
+        </div>
+        <div class="settings-row">
+          <label>Durata massima giro (ore)</label>
+          <input type="number" step="0.5" id="maxGiroOre">
+        </div>
+        <div class="settings-row">
+          <label>Rientro al deposito a fine giro</label>
+          <input type="checkbox" id="rientroDeposito" style="width:auto;">
+        </div>
+      </section>
+ 
+      <button class="btn-primary optimize-btn" id="optimizeBtn">OTTIMIZZA RITIRI</button>
+      <div class="status-line" id="optStatus"></div>
+    </aside>
+ 
+    <div class="mapcol">
+      <div id="map"></div>
+    </div>
+  </div>
+ 
+  <div class="results" id="resultsPanel">
+    <div class="results-inner" id="resultsInner"></div>
+  </div>
+</div>
+ 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
