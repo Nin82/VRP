@@ -18,7 +18,18 @@
 
   <div class="layout">
     <aside class="sidebar">
+      <div class="tabbar">
+        <button class="tab-btn active" data-tab="flotta">Flotta</button>
+        <button class="tab-btn" data-tab="ritiri">Ritiri</button>
+        <button class="tab-btn" data-tab="parametri">Parametri</button>
+      </div>
 
+      <button class="btn-primary optimize-btn" id="optimizeBtn">OTTIMIZZA RITIRI</button>
+      <button class="btn-ghost optimize-btn" id="calcolaGiriBtn" style="border:1px solid var(--border);margin-top:6px;">Calcola giri (senza assegnare autisti)</button>
+      <div class="status-line" id="optStatus"></div>
+
+      <div class="tab-content-scroll">
+      <div class="tab-panel active" id="tabFlotta" data-tabpanel="flotta">
       <section class="block">
         <h2>Deposito di partenza</h2>
         <div class="field">
@@ -33,6 +44,12 @@
       </section>
 
       <section class="block">
+        <h2>Giri confermati oggi <span class="count" id="confermatiCount">(0)</span></h2>
+        <div id="confermatiList"></div>
+        <div class="status-line" style="margin-top:6px;">Un giro confermato non viene più toccato dai ricalcoli — il driver riparte davvero da lì, non dal deposito.</div>
+      </section>
+
+      <section class="block">
         <h2>Flotta disponibile <span class="count" id="flottaCount">(0)</span></h2>
         <div id="flottaList"></div>
         <div class="row" style="margin-top:6px;">
@@ -40,18 +57,20 @@
         </div>
         <div class="dropzone" id="dropzoneFlotta" style="padding:12px;margin-top:8px;">
           <div style="font-size:11px;"><b>Trascina qui il file flotta</b> (Excel o CSV)</div>
-          <div class="cols">colonne attese: Nome/Autista · Orario partenza</div>
+          <div class="cols">colonne attese: Nome/Autista · Orario partenza · Disponibile fino (opzionale)</div>
         </div>
         <input type="file" id="fileInputFlotta" accept=".xlsx,.xls,.csv" style="display:none">
         <div class="status-line" style="margin-top:6px;">L'app userà solo i mezzi che servono davvero, in base a capacità e orari — non necessariamente tutti quelli elencati.</div>
       </section>
+      </div>
 
+      <div class="tab-panel" id="tabRitiri" data-tabpanel="ritiri">
       <section class="block">
         <h2>Ritiri <span class="count" id="ritiriCount">(0)</span></h2>
         <div class="dropzone" id="dropzone">
           <div><b>Trascina qui il file</b> (Excel o CSV)</div>
           <div>oppure clicca per selezionarlo</div>
-          <div class="cols">colonne attese: Cliente · Indirizzo · CAP · Località · Pronto dalle · Entro le (chiusura) · Bancali (oppure Metri cubi) · Metri lineari (opzionale)</div>
+          <div class="cols">colonne attese: Cliente · Indirizzo · CAP · Località · Pronto dalle · Entro le (chiusura) · Bancali (oppure Metri cubi) · Metri lineari (opzionale) · Bilici richiesti (opzionale)</div>
         </div>
         <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" style="display:none">
         <div class="file-summary" id="fileSummary" style="display:none;">
@@ -74,10 +93,16 @@
           </div>
           <div class="field"><label>Volume (m³)</label><input type="number" step="0.1" id="mQuantita"></div>
           <div class="field"><label>Metri lineari (solo se bancali pesanti/non impilabili — opzionale)</label><input type="number" step="0.1" id="mMetriLineari"></div>
+          <div class="field"><label>Bilici richiesti (opzionale — es. 2.5 per un cliente che vuole mezzi dedicati)</label><input type="number" step="0.5" id="mBiliciRichiesti"></div>
+          <div class="field"><label>Assegna a (opzionale — lascia "Automatico" se non sai già chi)</label>
+            <select id="mAssegnaA"><option value="">Automatico</option></select>
+          </div>
           <button class="btn-ghost" style="border:1px solid var(--border)" id="addManualBtn">+ aggiungi</button>
         </div>
       </section>
+      </div>
 
+      <div class="tab-panel" id="tabParametri" data-tabpanel="parametri">
       <section class="block">
         <h2>Parametri</h2>
         <div class="settings-row">
@@ -109,25 +134,51 @@
           <input type="number" step="0.5" id="maxGiroOre">
         </div>
         <div class="settings-row">
+          <label>Fine turno mezzi (ora) — oltre non parte un nuovo giro</label>
+          <input type="time" id="fineTurno">
+        </div>
+        <div class="settings-row">
+          <label>Attesa massima per tappa (min) — oltre, meglio un secondo giro</label>
+          <input type="number" step="5" id="maxAttesaMin">
+        </div>
+        <div class="settings-row">
           <label>Rientro al deposito a fine giro</label>
           <input type="checkbox" id="rientroDeposito" style="width:auto;">
         </div>
       </section>
-
-      <button class="btn-primary optimize-btn" id="optimizeBtn">OTTIMIZZA RITIRI</button>
-      <div class="status-line" id="optStatus"></div>
+      </div>
+      </div>
     </aside>
 
-    <div class="mapcol">
-      <div id="map"></div>
-    </div>
-    <div class="legendcol" id="fleetLegend">
-      <div class="legend-empty">Lancia un'ottimizzazione per vedere qui l'abbinamento clienti-mezzo.</div>
-    </div>
-  </div>
+    <div class="maincol">
+      <div class="main-tabbar">
+        <button class="main-tab-btn active" data-maintab="mappa">Mappa</button>
+        <button class="main-tab-btn" data-maintab="risultati">Risultati</button>
+        <button class="main-tab-btn" data-maintab="clienti">Per Cliente</button>
+      </div>
 
-  <div class="results" id="resultsPanel">
-    <div class="results-inner" id="resultsInner"></div>
+      <div class="main-tab-panel active" data-maintabpanel="mappa">
+        <div class="mapcol">
+          <div id="map"></div>
+        </div>
+        <div class="legendcol" id="fleetLegend">
+          <div class="legend-empty">Lancia un'ottimizzazione per vedere qui l'abbinamento clienti-mezzo.</div>
+        </div>
+      </div>
+
+      <div class="main-tab-panel" data-maintabpanel="risultati">
+        <div class="summary-table-wrap" id="summaryTableWrap">
+          <div class="legend-empty">Lancia un'ottimizzazione per vedere qui il riepilogo dei giri.</div>
+        </div>
+        <div class="results-inner" id="resultsInner"></div>
+      </div>
+
+      <div class="main-tab-panel" data-maintabpanel="clienti">
+        <div class="summary-table-wrap" id="clientTableWrap">
+          <div class="legend-empty">Lancia un'ottimizzazione per vedere qui l'abbinamento cliente → mezzo.</div>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 

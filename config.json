@@ -10,9 +10,11 @@
     "orarioEntro": ["entro le", "chiusura", "orario chiusura", "entro", "scadenza"],
     "metriLineari": ["metri lineari", "ml", "metri lin", "pianale", "ml occupati"],
     "bancali": ["bancali", "pallet", "pallets", "n. bancali", "numero bancali", "n bancali"],
+    "biliciRichiesti": ["bilici richiesti", "bilici dedicati", "mezzi dedicati", "camion dedicati", "n bilici", "bilici"],
     "volume": ["m3", "mc", "metri cubi", "volume", "mcubi", "m\u00b3"],
     "nomeMezzo": ["nome", "autista", "conducente", "mezzo", "targa"],
-    "orarioPartenzaMezzo": ["orario partenza", "partenza", "orario", "inizio turno"]
+    "orarioPartenzaMezzo": ["orario partenza", "partenza", "orario", "inizio turno"],
+    "fineDisponibilitaMezzo": ["disponibile fino", "fine disponibilita", "fine turno autista", "disponibile fino alle"]
   },
 
   "defaults": {
@@ -24,6 +26,8 @@
     "tolleranzaRitardoMin": 15,
     "maxGiroOre": 9,
     "orarioPartenza": "07:00",
+    "fineTurno": "19:00",
+    "maxAttesaMin": 90,
     "primoMezzoOrarioPartenza": "07:00",
     "rientroDeposito": true,
     "mapCenter": { "lat": 44.4938, "lng": 11.3387 },

@@ -1,96 +1,105 @@
 // ============================================================================
-// Ottimizzatore Ritiri — app.js
-// Struttura pensata per essere scomposta in moduli separati man mano che
-// si aggiungono nuove feature (es. js/geocoding.js, js/vrptw.js, js/ui.js).
-// Per ora è un unico file ES module, organizzato in sezioni commentate.
+// Tabellone Ritiri — app.js
+// Modello: TU assegni un ritiro a un driver (click-to-assign), l'app verifica
+// all'istante se regge (capacità, pianale, orari) e — se il driver ha già
+// qualcosa in giornata che non ci sta insieme — apre da sola un secondo giro
+// (ritorno in deposito, poi riparte) invece di forzare un unico giro continuo.
+// Nessun algoritmo decide da solo chi fa cosa: l'automazione qui è solo verifica.
 // ============================================================================
 
 // ---------------------------------------------------------------------------
-// CONFIG — caricata da config.json (richiede di essere servita via http,
-// non aperta con doppio click: da qui l'aggancio a Codespaces / un server locale)
+// CONFIG
 // ---------------------------------------------------------------------------
 let CONFIG = null;
 async function loadConfig(){
-  try{
-    const resp = await fetch('./config.json');
-    CONFIG = await resp.json();
-  }catch(e){
-    console.warn('config.json non caricato (apri il progetto tramite un server http, non con file://). Uso i default hardcoded.', e);
-    CONFIG = {
-      palette: ["#F2A93B","#3D8B8B","#C75146","#7C9070","#6E7BA8","#B98BC9","#D9B23D"],
-      headerSynonyms: {
-        cliente: ['cliente','ragione sociale','nome cliente','tenuta','azienda'],
-        indirizzo: ['indirizzo','via','indirizzo di ritiro','indirizzo ritiro'],
-        cap: ['cap','codice postale','zip','postal code'],
-        localita: ['localita','comune','citta','city','location'],
-        orario: ['orario ritiro','orario di ritiro','orario','ora ritiro','ora'],
-        bancali: ['bancali','pallet','pallets','n. bancali','numero bancali','n bancali'],
-        volume: ['m3','mc','metri cubi','volume','mcubi','m³']
-      },
-      defaults: {
-        capacitaBancali:33, volumeBancalePerM3:2.1, tempoSostaMin:20,
-        tolleranzaRitardoMin:15, maxGiroOre:9, orarioPartenza:'07:00',
-        maxMezzi:1, rientroDeposito:true,
-        mapCenter:{lat:44.4938,lng:11.3387}, mapZoom:7
-      },
-      endpoints: {
-        nominatimSearch:'https://nominatim.openstreetmap.org/search',
-        osrmTable:'https://router.project-osrm.org/table/v1/driving',
-        osrmRoute:'https://router.project-osrm.org/route/v1/driving',
-        osmTiles:'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'
-      },
-      geocoding: { requestDelayMs:1100, countryCode:'it', countryName:'Italia' }
-    };
-  }
+  const resp = await fetch('./config.json');
+  CONFIG = await resp.json();
 }
 
 // ---------------------------------------------------------------------------
 // STATO
 // ---------------------------------------------------------------------------
-let deposito = { via:"", cap:"", citta:"", lat:null, lng:null, geoDisplay:null };
-let ritiri = [];       // {id, cliente, indirizzo, cap, localita, orario, orarioEntro, quantita(m3), lat, lng, approssimato, cittaSospetta, cittaTrovata}
+let deposito = { via:"", cap:"", citta:"", lat:null, lng:null };
+let ritiri = [];        // {id, cliente, indirizzo, cap, localita, orario, orarioEntro, quantita, volumeDichiarato, metriLineari, bancaliStandard, biliciRichiesti, bisognaOrario, assegnaA, lat, lng, approssimato, cittaSospetta}
 let ritiroIdSeq = 1;
-let flotta = [];       // {id, orarioPartenza} — un mezzo per riga, ognuno con la propria partenza
+let flotta = [];        // {id, nome, orarioPartenza, fineDisponibilita}
 let mezzoIdSeq = 1;
+let giriConfermati = []; // {idConferma, flottaId, nome, stops, partenzaMin, minuti, endLat, endLng, ritiriIds}
+let confermaIdSeq = 1;
 const geocodeCache = {};
 
-let map, markersLayer, routesLayer;
+let map, markersLayer, routeLinesLayer;
+let ritiroSelezionatoId = null;
 
 // ---------------------------------------------------------------------------
-// UTILITY GENERICHE
+// UTILITY
 // ---------------------------------------------------------------------------
 function $(id){ return document.getElementById(id); }
 function escapeHtml(s){
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-function setStatus(id, msg, isErr){
-  const el = $(id);
+function setStatus(msg, isErr){
+  const el = $('globalStatus');
   el.textContent = msg; el.className = 'status-line' + (isErr?' err':'');
 }
 function toMinutes(hhmm){
   if(!hhmm) return null;
-  const [h,m] = hhmm.split(':').map(Number);
+  const [h,m] = String(hhmm).split(':').map(Number);
   if(isNaN(h)) return null;
   return h*60+m;
 }
-function fmtClock(min){
-  const h = Math.floor(min/60)%24, m = Math.round(min%60);
+function fmtClock(minRaw){
+  const totalMin = Math.round(minRaw);
+  const h = Math.floor(totalMin/60)%24, m = totalMin%60;
   return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+}
+function haversineKm(lat1,lng1,lat2,lng2){
+  const R=6371, toRad=x=>x*Math.PI/180;
+  const dLat=toRad(lat2-lat1), dLng=toRad(lng2-lng1);
+  const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
+  return R*2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// ids dei ritiri già dentro un giro confermato: esclusi da OGNI ricalcolo attivo,
+// così un giro confermato non può più essere "visto" (e quindi ri-confermato,
+// o disassegnato per errore) dal tabellone — è congelato per davvero.
+function idsRitiriConfermati(){
+  return new Set(giriConfermati.flatMap(g => g.ritiriIds.map(String)));
+}
+
+// da chiamare dopo OGNI mutazione che tocca ritiri/flotta: rimuove riferimenti
+// a id che non esistono più (giri confermati orfani, assegnazioni a mezzi cancellati)
+// e ricalcola tutte le colonne driver — lo stato mostrato è sempre coerente,
+// mai serve ricaricare la pagina per "ripulire" qualcosa.
+async function ricalcolaTuttoLoStato(){
+  const idRitiriEsistenti = new Set(ritiri.map(r=>String(r.id)));
+  const idFlottaEsistenti = new Set(flotta.map(f=>String(f.id)));
+  const primaLen = giriConfermati.length;
+  giriConfermati = giriConfermati.filter(g =>
+    idFlottaEsistenti.has(String(g.flottaId)) && g.ritiriIds.every(id=>idRitiriEsistenti.has(String(id)))
+  );
+  if(giriConfermati.length !== primaLen) salva();
+
+  for(const d of flotta) await ricalcolaColonnaDriver(d);
+  renderConfermati();
+  renderTabellone();
+  if(map) renderMappa();
 }
 
 // ---------------------------------------------------------------------------
-// PERSISTENZA (window.storage, personale — richiede l'ambiente Claude/artifact;
-// se non disponibile fallisce silenziosamente e l'app funziona lo stesso)
+// PERSISTENZA
 // ---------------------------------------------------------------------------
-async function salva(){
+function salva(){
   try{
-    localStorage.setItem('ottimizzatore-ritiri:v4', JSON.stringify({ deposito, ritiri, ritiroIdSeq, flotta, mezzoIdSeq }));
+    localStorage.setItem('tabellone-ritiri:v1', JSON.stringify({
+      deposito, ritiri, ritiroIdSeq, flotta, mezzoIdSeq, giriConfermati, confermaIdSeq
+    }));
   }catch(e){ console.warn('salvataggio locale fallito', e); }
 }
-async function carica(){
+function carica(){
   try{
-    const raw = localStorage.getItem('ottimizzatore-ritiri:v4');
+    const raw = localStorage.getItem('tabellone-ritiri:v1');
     if(raw){
       const d = JSON.parse(raw);
       deposito = d.deposito || deposito;
@@ -98,225 +107,21 @@ async function carica(){
       ritiroIdSeq = d.ritiroIdSeq || (ritiri.length+1);
       flotta = d.flotta || [];
       mezzoIdSeq = d.mezzoIdSeq || (flotta.length+1);
+      giriConfermati = d.giriConfermati || [];
+      confermaIdSeq = d.confermaIdSeq || (giriConfermati.length+1);
     }
   }catch(e){ console.warn('lettura locale fallita', e); }
   if(flotta.length === 0){
-    flotta = [{ id: mezzoIdSeq++, orarioPartenza: CONFIG.defaults.primoMezzoOrarioPartenza }];
+    flotta = [{ id: mezzoIdSeq++, nome:'', orarioPartenza: CONFIG.defaults.primoMezzoOrarioPartenza, fineDisponibilita:'' }];
   }
   $('depositoVia').value = deposito.via || "";
   $('depositoCap').value = deposito.cap || "";
   $('depositoCitta').value = deposito.citta || "";
-  if(deposito.lat) setStatus('depositoStatus', `geolocalizzato ✓ — ${deposito.geoDisplay||''}`, false);
-  renderRitiri();
-  renderMarkersBase();
-  renderFlotta();
+  if(deposito.lat) setStatus(`deposito geolocalizzato ✓`, false);
 }
 
 // ---------------------------------------------------------------------------
-// MAPPA
-// ---------------------------------------------------------------------------
-function initMap(){
-  map = L.map('map', { zoomControl: true }).setView([CONFIG.defaults.mapCenter.lat, CONFIG.defaults.mapCenter.lng], CONFIG.defaults.mapZoom);
-  L.tileLayer(CONFIG.endpoints.osmTiles, { attribution: '&copy; OpenStreetMap contributors', maxZoom: 18 }).addTo(map);
-  markersLayer = L.layerGroup().addTo(map);
-  routesLayer = L.layerGroup().addTo(map);
-}
-function renderFlotta(){
-  $('flottaCount').textContent = `(${flotta.length})`;
-  $('flottaList').innerHTML = flotta.map((m,i) => `
-    <div class="item-card-lite" style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border-soft);">
-      <input type="text" data-mezzo-nome="${m.id}" value="${escapeHtml(m.nome || '')}" placeholder="Mezzo ${i+1} / autista" style="flex:1;">
-      <input type="time" data-mezzo-orario="${m.id}" value="${m.orarioPartenza}" style="width:110px;">
-      <button class="btn-danger" data-del-mezzo="${m.id}">×</button>
-    </div>
-  `).join('');
-  $('flottaList').querySelectorAll('[data-mezzo-nome]').forEach(inp=>{
-    inp.addEventListener('change', ()=>{
-      const m = flotta.find(x=>x.id===parseInt(inp.dataset.mezzoNome));
-      if(m){ m.nome = inp.value.trim(); salva(); }
-    });
-  });
-  $('flottaList').querySelectorAll('[data-mezzo-orario]').forEach(inp=>{
-    inp.addEventListener('change', ()=>{
-      const m = flotta.find(x=>x.id===parseInt(inp.dataset.mezzoOrario));
-      if(m){ m.orarioPartenza = inp.value; salva(); }
-    });
-  });
-  $('flottaList').querySelectorAll('[data-del-mezzo]').forEach(btn=>{
-    btn.addEventListener('click', ()=>{
-      if(flotta.length<=1){ alert('Deve restare almeno un mezzo.'); return; }
-      flotta = flotta.filter(m=>m.id!==parseInt(btn.dataset.delMezzo));
-      renderFlotta(); salva();
-    });
-  });
-}
-
-function renderMarkersBase(){
-  markersLayer.clearLayers();
-  if(deposito.lat){
-    L.circleMarker([deposito.lat, deposito.lng], { radius:7, color:'#E8E6E0', weight:2, fillColor:'#14181C', fillOpacity:1 })
-      .bindTooltip('Deposito').addTo(markersLayer);
-  }
-  ritiri.forEach(r=>{
-    if(r.lat){
-      L.circleMarker([r.lat, r.lng], { radius:6, color:'#8A9099', weight:1.5, fillColor:'#20272F', fillOpacity:1 })
-        .bindTooltip(r.cliente).addTo(markersLayer);
-    }
-  });
-}
-
-// ---------------------------------------------------------------------------
-// IMPORT FILE (Excel / CSV) — SheetJS
-// ---------------------------------------------------------------------------
-function normalizeHeader(h){
-  return String(h||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim();
-}
-function matchColumn(headers, keys){
-  for(let i=0;i<headers.length;i++){
-    const h = normalizeHeader(headers[i]);
-    if(keys.some(k => h === k || h.includes(k))) return i;
-  }
-  return -1;
-}
-function parseItalianNumber(v){
-  if(typeof v === 'number') return v;
-  let s = String(v||'').trim();
-  if(!s) return 0;
-  if(s.includes(',') && s.includes('.')) s = s.replace(/\./g,'').replace(',', '.');
-  else if(s.includes(',')) s = s.replace(',', '.');
-  const n = parseFloat(s);
-  return isNaN(n) ? 0 : n;
-}
-function normalizeOrario(v){
-  if(v === null || v === undefined || v === '') return '';
-  if(v instanceof Date){
-    const hh = String(v.getUTCHours()).padStart(2,'0');
-    const mm = String(v.getUTCMinutes()).padStart(2,'0');
-    return `${hh}:${mm}`;
-  }
-  if(typeof v === 'number'){
-    const totalMin = Math.round(v * 24 * 60);
-    const hh = String(Math.floor(totalMin/60) % 24).padStart(2,'0');
-    const mm = String(totalMin % 60).padStart(2,'0');
-    return `${hh}:${mm}`;
-  }
-  const s = String(v).trim();
-  const m = s.match(/(\d{1,2})[:.](\d{2})/);
-  if(m) return `${m[1].padStart(2,'0')}:${m[2]}`;
-  return s;
-}
-
-function processWorkbook(data){
-  const wb = XLSX.read(data, { type:'array', cellDates:true });
-  const sheet = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(sheet, { header:1, raw:true, defval:'' });
-  if(rows.length < 2){ setStatus('optStatus', 'Il file non contiene righe di dati.', true); return; }
-  const headers = rows[0];
-  const syn = CONFIG.headerSynonyms;
-  const iCliente = matchColumn(headers, syn.cliente);
-  const iIndirizzo = matchColumn(headers, syn.indirizzo);
-  const iCap = matchColumn(headers, syn.cap);
-  const iLocalita = matchColumn(headers, syn.localita);
-  const iOrario = matchColumn(headers, syn.orario);
-  const iOrarioEntro = matchColumn(headers, syn.orarioEntro);
-  const iMetriLineari = matchColumn(headers, syn.metriLineari);
-  const iVolume = matchColumn(headers, syn.volume);
-  const iBancali = matchColumn(headers, syn.bancali);
-
-  if(iCliente === -1 || iIndirizzo === -1){
-    setStatus('optStatus', 'Colonne non riconosciute: servono almeno "Cliente" e "Indirizzo".', true);
-    return;
-  }
-
-  const volumeBancale = parseFloat($('volumeBancale').value) || CONFIG.defaults.volumeBancalePerM3;
-
-  const nuovi = [];
-  for(let r=1;r<rows.length;r++){
-    const row = rows[r];
-    if(!row || row.every(c => c === '' || c === undefined || c === null)) continue;
-    const cliente = String(row[iCliente]||'').trim();
-    const indirizzo = String(row[iIndirizzo]||'').trim();
-    const cap = iCap !== -1 ? String(row[iCap]||'').trim() : '';
-    const localita = iLocalita !== -1 ? String(row[iLocalita]||'').trim() : '';
-    if(!cliente || !indirizzo) continue;
-    const orario = iOrario !== -1 ? normalizeOrario(row[iOrario]) : '';
-       const orarioEntro = iOrarioEntro !== -1 ? normalizeOrario(row[iOrarioEntro]) : '';
-    const metriLineari = iMetriLineari !== -1 ? parseItalianNumber(row[iMetriLineari]) : 0;
-    let quantita = 0;
-    let bancaliStandard = 0;
-    if(iVolume !== -1) quantita = parseItalianNumber(row[iVolume]);
-    else if(iBancali !== -1){
-      bancaliStandard = parseItalianNumber(row[iBancali]);
-      quantita = bancaliStandard * volumeBancale;
-    }
-    nuovi.push({ id: ritiroIdSeq++, cliente, indirizzo, cap, localita, orario, orarioEntro, quantita, metriLineari, bancaliStandard, lat:null, lng:null, approssimato:false });
-  }
-
-  if(nuovi.length === 0){ setStatus('optStatus', 'Nessun ritiro valido trovato nel file.', true); return; }
-
-  if(ritiri.length > 0){
-    const sostituisci = confirm(`Ci sono già ${ritiri.length} ritiri caricati. Vuoi sostituirli con i ${nuovi.length} del nuovo file?\n(Annulla per accodarli invece)`);
-    ritiri = sostituisci ? nuovi : ritiri.concat(nuovi);
-  } else {
-    ritiri = nuovi;
-  }
-  setStatus('optStatus', `Caricati ${nuovi.length} ritiri dal file.`, false);
-  renderRitiri(); salva();
-}
-
-function handleFile(file){
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    try{ processWorkbook(new Uint8Array(e.target.result)); }
-    catch(err){ console.error(err); setStatus('optStatus', 'Errore lettura file: ' + err.message, true); }
-  };
-  reader.readAsArrayBuffer(file);
-}
-
-function processFlottaWorkbook(data){
-  const wb = XLSX.read(data, { type:'array' });
-  const sheet = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(sheet, { header:1, raw:true, defval:'' });
-  if(rows.length < 2){ setStatus('optStatus', 'Il file flotta non contiene righe di dati.', true); return; }
-  const headers = rows[0];
-  const syn = CONFIG.headerSynonyms;
-  const iNome = matchColumn(headers, syn.nomeMezzo);
-  const iOrario = matchColumn(headers, syn.orarioPartenzaMezzo);
-
-  const nuovi = [];
-  for(let r=1;r<rows.length;r++){
-    const row = rows[r];
-    if(!row || row.every(c => c === '' || c === undefined || c === null)) continue;
-    const nome = iNome !== -1 ? String(row[iNome]||'').trim() : '';
-    const orarioPartenza = iOrario !== -1 ? normalizeOrario(row[iOrario]) : '';
-    if(!orarioPartenza) continue;
-    nuovi.push({ id: mezzoIdSeq++, nome, orarioPartenza });
-  }
-  if(nuovi.length === 0){ setStatus('optStatus', 'Nessun mezzo valido trovato nel file (serve almeno l\'orario di partenza).', true); return; }
-
-  if(flotta.length > 0){
-    const sostituisci = confirm(`Ci sono già ${flotta.length} mezzi in elenco. Vuoi sostituirli con i ${nuovi.length} del file?\n(Annulla per accodarli invece)`);
-    flotta = sostituisci ? nuovi : flotta.concat(nuovi);
-  } else {
-    flotta = nuovi;
-  }
-  setStatus('optStatus', `Caricati ${nuovi.length} mezzi dal file.`, false);
-  renderFlotta(); salva();
-}
-
-function handleFileFlotta(file){
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    try{ processFlottaWorkbook(new Uint8Array(e.target.result)); }
-    catch(err){ console.error(err); setStatus('optStatus', 'Errore lettura file flotta: ' + err.message, true); }
-  };
-  reader.readAsArrayBuffer(file);
-}
-
-// ---------------------------------------------------------------------------
-// GEOCODING — ricerca strutturata a più livelli + verifica città
-// (bug fix: un risultato senza campo città verificabile NON viene più
-// accettato automaticamente — si scende a un livello più sicuro)
+// GEOCODING — multilivello con verifica città
 // ---------------------------------------------------------------------------
 function normalizeCity(s){
   return String(s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z\s]/g,'').trim();
@@ -341,13 +146,11 @@ function extractCity(hit){
   if(!hit || !hit.address) return null;
   return hit.address.city || hit.address.town || hit.address.village || hit.address.hamlet || hit.address.municipality || hit.address.county || null;
 }
-// un risultato senza città verificabile è trattato come sospetto, non accettato al volo
 function verifiedCity(input, found){
   if(!input) return true;
   if(!found) return false;
   return cityMatches(input, found);
 }
-
 async function nominatimStructured(params){
   const qs = new URLSearchParams({ format:'json', limit:'1', addressdetails:'1', countrycodes:CONFIG.geocoding.countryCode, ...params }).toString();
   const resp = await fetch(`${CONFIG.endpoints.nominatimSearch}?${qs}`, { headers:{ 'Accept':'application/json' } });
@@ -362,25 +165,21 @@ async function nominatimFreeform(q){
   const data = await resp.json();
   return data.length ? data[0] : null;
 }
-
 async function geocodeMultilivello({ via, cap, citta }){
   const key = `${via}|${cap}|${citta}`.toLowerCase().trim();
   if(geocodeCache[key]) return geocodeCache[key];
   const delay = CONFIG.geocoding.requestDelayMs;
   const country = CONFIG.geocoding.countryName;
-
-  let hit = null, precisione = 'esatto', scartatoPerCittaSbagliata = false;
+  let hit = null, precisione = 'esatto';
 
   if(via){
     const h = await nominatimStructured({ street: via, postalcode: cap||'', city: citta||'', country });
     if(h && verifiedCity(citta, extractCity(h))) hit = h;
-    else if(h) scartatoPerCittaSbagliata = true;
   }
   if(!hit && via){
     await sleep(delay);
     const h = await nominatimFreeform(`${via}, ${cap||''} ${citta||''}, ${country}`);
     if(h && verifiedCity(citta, extractCity(h))) hit = h;
-    else if(h) scartatoPerCittaSbagliata = true;
   }
   if(!hit && cap){
     await sleep(delay);
@@ -392,149 +191,27 @@ async function geocodeMultilivello({ via, cap, citta }){
     hit = await nominatimFreeform(`${citta}, ${country}`);
     if(hit) precisione = 'approssimato';
   }
+  if(!hit) throw new Error(`indirizzo non trovato: ${via||''} ${cap||''} ${citta||''}`.trim());
 
-  if(!hit){
-    const msg = scartatoPerCittaSbagliata
-      ? `trovato solo un indirizzo omonimo in un'altra città per: ${via||''} (${citta||''})`
-      : `indirizzo non trovato: ${via||''} ${cap||''} ${citta||''}`.trim();
-    throw new Error(msg);
-  }
   const res = {
     lat: parseFloat(hit.lat), lng: parseFloat(hit.lon), precisione,
-    displayName: hit.display_name, cittaTrovata: extractCity(hit),
+    cittaTrovata: extractCity(hit),
     cittaSospetta: citta ? !cityMatches(citta, extractCity(hit)) : false
   };
   geocodeCache[key] = res;
   return res;
 }
-
-// ---------------------------------------------------------------------------
-// VRPTW — costruzione a inserimento più economico con vincoli di
-// capacità e finestra oraria; minimizza i mezzi usati sul totale disponibile
-// ---------------------------------------------------------------------------
-// metri lineari "effettivi" di un ritiro: se l'utente ne ha dichiarati esplicitamente (eccezione,
-// es. bancali pesanti/bassi non impilabili), si usano quelli; altrimenti si stima dal volume
-// assumendo la densità media di un carico normale a pieno regime (capacitaM3/capacitaLineare).
-function effectiveML(r, capacitaM3PerMezzo, capacitaLineareM, metriLineariPerBancale){
-  if(r.metriLineari && r.metriLineari > 0) return r.metriLineari;                    // eccezione dichiarata (fuori misura)
-  if(r.bancaliStandard && r.bancaliStandard > 0) return r.bancaliStandard * metriLineariPerBancale; // bancali standard noti
-  const densita = capacitaM3PerMezzo / capacitaLineareM;                             // fallback: solo m3 dichiarati (es. da colonna "Metri cubi")
-  return (r.quantita||0) / densita;
-}
-
-function checkFeasibleAndCost(routeStops, durMin, ritiriArr, tempoSostaMin, partenzaMin, tolleranzaMin){
-  let cursor = partenzaMin, prev = 0, totalTravel = 0;
-  for(const idx of routeStops){
-    const travel = durMin[prev][idx];
-    cursor += travel; totalTravel += travel;
-    const r = ritiriArr[idx-1];
-    const readyMin = toMinutes(r.orario);        // pronto dalle (nessun problema arrivare dopo)
-    const deadlineMin = toMinutes(r.orarioEntro); // entro le / chiusura cliente
-    if(readyMin !== null && cursor < readyMin) cursor = readyMin; // si aspetta che sia pronta
-    if(deadlineMin !== null && cursor > deadlineMin + tolleranzaMin) return { feasible:false };
-    cursor += tempoSostaMin;
-    prev = idx;
-  }
-  return { feasible:true, addedCost: totalTravel };
-}
-
-function buildRoutesVRPTW(ritiriArr, durMin, capacitaM3PerMezzo, capacitaLineareM, metriLineariPerBancale, flotta, tempoSostaMin, tolleranzaMin){
-  const partenzeMin = flotta.map(f => toMinutes(f.orarioPartenza));
-  const partenzaMinima = Math.min(...partenzeMin);
-
-  const irraggiungibili = [];
-  let unrouted = ritiriArr.map((r,i)=>i+1).filter(idx=>{
-    const chk = checkFeasibleAndCost([idx], durMin, ritiriArr, tempoSostaMin, partenzaMinima, tolleranzaMin);
-    if(!chk.feasible){ irraggiungibili.push(ritiriArr[idx-1]); return false; }
-    return true;
-  });
-
-  const routes = [];
-  for(let vi=0; vi<flotta.length; vi++){
-    const partenzaMin = partenzeMin[vi];
-    let route = { stops:[], carico:0, metriLineari:0, partenzaMin };
-
-    const fattibiliPerQuestoMezzo = unrouted.filter(idx=>
-      checkFeasibleAndCost([idx], durMin, ritiriArr, tempoSostaMin, partenzaMin, tolleranzaMin).feasible
-    );
-    if(fattibiliPerQuestoMezzo.length > 0){
-      const conOrario = fattibiliPerQuestoMezzo.filter(i => toMinutes(ritiriArr[i-1].orario) !== null);
-      const seed = conOrario.length > 0
-        ? conOrario.reduce((b,i)=> toMinutes(ritiriArr[i-1].orario) < toMinutes(ritiriArr[b-1].orario) ? i : b, conOrario[0])
-        : fattibiliPerQuestoMezzo.reduce((b,i)=> durMin[0][i]>durMin[0][b]?i:b, fattibiliPerQuestoMezzo[0]);
-      route.stops.push(seed);
-      route.carico += ritiriArr[seed-1].quantita||0;
-      route.metriLineari += effectiveML(ritiriArr[seed-1], capacitaM3PerMezzo, capacitaLineareM, metriLineariPerBancale);
-      unrouted = unrouted.filter(i=>i!==seed);
-    }
-    let improved = true;
-    while(improved){
-      improved = false;
-      let bestC=null, bestPos=null, bestCost=Infinity;
-      for(const cand of unrouted){
-        const qty = ritiriArr[cand-1].quantita||0;
-        const ml = effectiveML(ritiriArr[cand-1], capacitaM3PerMezzo, capacitaLineareM, metriLineariPerBancale);
-        if(route.carico+qty > capacitaM3PerMezzo) continue;
-        if(route.metriLineari+ml > capacitaLineareM) continue;
-        for(let pos=0; pos<=route.stops.length; pos++){
-          const trial = [...route.stops.slice(0,pos), cand, ...route.stops.slice(pos)];
-          const chk = checkFeasibleAndCost(trial, durMin, ritiriArr, tempoSostaMin, partenzaMin, tolleranzaMin);
-          if(chk.feasible && chk.addedCost < bestCost){ bestCost=chk.addedCost; bestC=cand; bestPos=pos; }
-        }
-      }
-      if(bestC!==null){
-        route.stops.splice(bestPos,0,bestC);
-        route.carico += ritiriArr[bestC-1].quantita||0;
-        route.metriLineari += effectiveML(ritiriArr[bestC-1], capacitaM3PerMezzo, capacitaLineareM, metriLineariPerBancale);
-        unrouted = unrouted.filter(i=>i!==bestC);
-        improved = true;
-      }
-    }
-    routes.push(route);
-  }
-  return { routes, nonAssegnati: unrouted.map(i=>ritiriArr[i-1]), irraggiungibili };
-}
-
-// raffina l'ordine di un giro già costruito (riduce i km) SENZA violare
-// le finestre orarie: uno scambio 2-opt viene accettato solo se resta fattibile
-function constrainedTwoOpt(stops, durMin, ritiriArr, tempoSostaMin, partenzaMin, tolleranzaMin){
-  let best = stops.slice();
-  let bestChk = checkFeasibleAndCost(best, durMin, ritiriArr, tempoSostaMin, partenzaMin, tolleranzaMin);
-  let bestCost = bestChk.addedCost;
-  let improved = true;
-  while(improved){
-    improved = false;
-    for(let i=0;i<best.length-1;i++){
-      for(let j=i+1;j<best.length;j++){
-        const cand = best.slice(0,i).concat(best.slice(i,j+1).reverse(), best.slice(j+1));
-        const chk = checkFeasibleAndCost(cand, durMin, ritiriArr, tempoSostaMin, partenzaMin, tolleranzaMin);
-        if(chk.feasible && chk.addedCost < bestCost - 1e-6){
-          best = cand; bestCost = chk.addedCost; improved = true;
-        }
-      }
-    }
-  }
-  return best;
-}
-
-function routeLength(order, matrix){
-  let t=0; for(let i=0;i<order.length-1;i++) t += matrix[order[i]][order[i+1]]; return t;
-}
-
-// ---------------------------------------------------------------------------
-// OSRM
-// ---------------------------------------------------------------------------
 async function osrmTable(coords){
   const coordStr = coords.map(c => `${c[1]},${c[0]}`).join(';');
-  const resp = await fetch(`${CONFIG.endpoints.osrmTable}/${coordStr}?annotations=duration,distance`);
-  if(!resp.ok) throw new Error('OSRM table fallito');
+  const resp = await fetch(`${CONFIG.endpoints.osrmTable}/${coordStr}?annotations=duration`);
+  if(!resp.ok) throw new Error('OSRM fallito');
   const data = await resp.json();
   if(data.code !== 'Ok') throw new Error('OSRM: ' + data.code);
   return data;
 }
 async function osrmRoute(coords){
   const coordStr = coords.map(c => `${c[1]},${c[0]}`).join(';');
-  const resp = await fetch(`${CONFIG.endpoints.osrmRoute}/${coordStr}?overview=full&geometries=geojson`);
+  const resp = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordStr}?overview=full&geometries=geojson`);
   if(!resp.ok) throw new Error('OSRM route fallito');
   const data = await resp.json();
   if(data.code !== 'Ok') throw new Error('OSRM: ' + data.code);
@@ -542,48 +219,646 @@ async function osrmRoute(coords){
 }
 
 // ---------------------------------------------------------------------------
-// RENDERING — liste, righe ritiro, risultati
+// IMPORT FILE (Excel / CSV)
 // ---------------------------------------------------------------------------
-function renderRitiri(){
-  $('ritiriCount').textContent = `(${ritiri.length})`;
-  const scrollBox = $('ritiriScroll');
-  const summary = $('fileSummary');
-  if(ritiri.length === 0){
-    scrollBox.style.display = 'none'; summary.style.display = 'none';
+function normalizeHeader(h){ return String(h||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim(); }
+function matchColumn(headers, keys){
+  for(let i=0;i<headers.length;i++){
+    const h = normalizeHeader(headers[i]);
+    if(keys.some(k => h === k || h.includes(k))) return i;
+  }
+  return -1;
+}
+function parseItalianNumber(v){
+  if(typeof v === 'number') return v;
+  let s = String(v||'').trim();
+  if(!s) return 0;
+  if(s.includes(',') && s.includes('.')) s = s.replace(/\./g,'').replace(',', '.');
+  else if(s.includes(',')) s = s.replace(',', '.');
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+function normalizeOrario(v){
+  if(v === null || v === undefined || v === '') return '';
+  if(v instanceof Date){
+    return `${String(v.getUTCHours()).padStart(2,'0')}:${String(v.getUTCMinutes()).padStart(2,'0')}`;
+  }
+  if(typeof v === 'number'){
+    const totalMin = Math.round(v * 24 * 60);
+    return `${String(Math.floor(totalMin/60)%24).padStart(2,'0')}:${String(totalMin%60).padStart(2,'0')}`;
+  }
+  const s = String(v).trim();
+  const m = s.match(/(\d{1,2})[:.](\d{2})/);
+  return m ? `${m[1].padStart(2,'0')}:${m[2]}` : s;
+}
+function contaPezzi(biliciRichiesti){
+  if(!biliciRichiesti || biliciRichiesti <= 0) return 0;
+  const interi = Math.floor(biliciRichiesti);
+  const fraz = biliciRichiesti - interi;
+  return interi + (fraz > 1e-6 ? 1 : 0);
+}
+
+function processWorkbook(data){
+  const wb = XLSX.read(data, { type:'array', cellDates:true });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sheet, { header:1, raw:true, defval:'' });
+  if(rows.length < 2){ setStatus('Il file non contiene righe di dati.', true); return; }
+  const headers = rows[0];
+  const syn = CONFIG.headerSynonyms;
+  const iCliente = matchColumn(headers, syn.cliente);
+  const iIndirizzo = matchColumn(headers, syn.indirizzo);
+  const iCap = matchColumn(headers, syn.cap);
+  const iLocalita = matchColumn(headers, syn.localita);
+  const iOrario = matchColumn(headers, syn.orario);
+  const iOrarioEntro = matchColumn(headers, syn.orarioEntro);
+  const iMetriLineari = matchColumn(headers, syn.metriLineari);
+  const iBiliciRichiesti = matchColumn(headers, syn.biliciRichiesti);
+  const iVolume = matchColumn(headers, syn.volume);
+  const iBancali = matchColumn(headers, syn.bancali);
+
+  if(iCliente === -1 || iIndirizzo === -1){
+    setStatus('Colonne non riconosciute: servono almeno "Cliente" e "Indirizzo".', true);
     return;
   }
+  const volumeBancale = parseFloat($('volumeBancale').value) || CONFIG.defaults.volumeBancalePerM3;
+
+  const nuovi = [];
+  for(let r=1;r<rows.length;r++){
+    const row = rows[r];
+    if(!row || row.every(c => c === '' || c === undefined || c === null)) continue;
+    const cliente = String(row[iCliente]||'').trim();
+    const indirizzo = String(row[iIndirizzo]||'').trim();
+    const cap = iCap !== -1 ? String(row[iCap]||'').trim() : '';
+    const localita = iLocalita !== -1 ? String(row[iLocalita]||'').trim() : '';
+    if(!cliente || !indirizzo) continue;
+    const orario = iOrario !== -1 ? normalizeOrario(row[iOrario]) : '';
+    const orarioEntro = iOrarioEntro !== -1 ? normalizeOrario(row[iOrarioEntro]) : '';
+    const metriLineari = iMetriLineari !== -1 ? parseItalianNumber(row[iMetriLineari]) : 0;
+    const biliciRichiesti = iBiliciRichiesti !== -1 ? parseItalianNumber(row[iBiliciRichiesti]) : 0;
+    let quantita = 0, bancaliStandard = 0, volumeDichiarato = false;
+    if(iVolume !== -1 && parseItalianNumber(row[iVolume]) > 0){ quantita = parseItalianNumber(row[iVolume]); volumeDichiarato = true; }
+    else if(iBancali !== -1){ bancaliStandard = parseItalianNumber(row[iBancali]); quantita = bancaliStandard * volumeBancale; }
+
+    const pezzi = contaPezzi(biliciRichiesti);
+    if(pezzi >= 2){
+      const interi = Math.floor(biliciRichiesti), fraz = biliciRichiesti - interi;
+      for(let k=0;k<interi;k++){
+        nuovi.push({ id: ritiroIdSeq++, cliente:`${cliente} (bilico ${k+1}/${pezzi})`, indirizzo, cap, localita,
+          orario:'', orarioEntro:'', quantita:0, volumeDichiarato:false, metriLineari:0, bancaliStandard:0, biliciRichiesti:1,
+          bisognaOrario:true, assegnaA:null, lat:null, lng:null, approssimato:false });
+      }
+      if(fraz > 1e-6){
+        nuovi.push({ id: ritiroIdSeq++, cliente:`${cliente} (bilico ${pezzi}/${pezzi})`, indirizzo, cap, localita,
+          orario:'', orarioEntro:'', quantita:0, volumeDichiarato:false, metriLineari:0, bancaliStandard:0, biliciRichiesti:fraz,
+          bisognaOrario:true, assegnaA:null, lat:null, lng:null, approssimato:false });
+      }
+    } else {
+      nuovi.push({ id: ritiroIdSeq++, cliente, indirizzo, cap, localita, orario, orarioEntro, quantita, volumeDichiarato, metriLineari,
+        bancaliStandard, biliciRichiesti, bisognaOrario:false, assegnaA:null, lat:null, lng:null, approssimato:false });
+    }
+  }
+
+  if(nuovi.length === 0){ setStatus('Nessun ritiro valido trovato nel file.', true); return; }
+  if(ritiri.length > 0){
+    const sostituisci = confirm(`Ci sono già ${ritiri.length} ritiri caricati. Sostituirli con i ${nuovi.length} del nuovo file?\n(Annulla per accodarli invece)`);
+    ritiri = sostituisci ? nuovi : ritiri.concat(nuovi);
+  } else {
+    ritiri = nuovi;
+  }
+  setStatus(`Caricati ${nuovi.length} ritiri dal file.`, false);
+  renderRitiri();
+  ricalcolaTuttoLoStato();
+  salva();
+
+  const daProgrammare = nuovi.filter(r => r.bisognaOrario);
+  if(daProgrammare.length) avviaCodaMaschereBilici(daProgrammare);
+}
+function handleFile(file){
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try{ processWorkbook(new Uint8Array(e.target.result)); }
+    catch(err){ console.error(err); setStatus('Errore lettura file: ' + err.message, true); }
+  };
+  reader.readAsArrayBuffer(file);
+}
+function processFlottaWorkbook(data){
+  const wb = XLSX.read(data, { type:'array' });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sheet, { header:1, raw:true, defval:'' });
+  if(rows.length < 2){ setStatus('Il file flotta non contiene righe di dati.', true); return; }
+  const headers = rows[0];
+  const syn = CONFIG.headerSynonyms;
+  const iNome = matchColumn(headers, syn.nomeMezzo);
+  const iOrario = matchColumn(headers, syn.orarioPartenzaMezzo);
+  const iFineDisp = matchColumn(headers, syn.fineDisponibilitaMezzo);
+
+  const nuovi = [];
+  for(let r=1;r<rows.length;r++){
+    const row = rows[r];
+    if(!row || row.every(c => c === '' || c === undefined || c === null)) continue;
+    const nome = iNome !== -1 ? String(row[iNome]||'').trim() : '';
+    const orarioPartenza = iOrario !== -1 ? normalizeOrario(row[iOrario]) : '';
+    const fineDisponibilita = iFineDisp !== -1 ? normalizeOrario(row[iFineDisp]) : '';
+    if(!orarioPartenza) continue;
+    nuovi.push({ id: mezzoIdSeq++, nome, orarioPartenza, fineDisponibilita });
+  }
+  if(nuovi.length === 0){ setStatus("Nessun mezzo valido (serve almeno l'orario di partenza).", true); return; }
+  if(flotta.length > 0){
+    const sostituisci = confirm(`Ci sono già ${flotta.length} mezzi. Sostituirli con i ${nuovi.length} del file?\n(Annulla per accodarli invece)`);
+    flotta = sostituisci ? nuovi : flotta.concat(nuovi);
+  } else { flotta = nuovi; }
+  setStatus(`Caricati ${nuovi.length} mezzi dal file.`, false);
+  renderFlotta();
+  ricalcolaTuttoLoStato();
+  salva();
+}
+function handleFileFlotta(file){
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try{ processFlottaWorkbook(new Uint8Array(e.target.result)); }
+    catch(err){ console.error(err); setStatus('Errore lettura file flotta: ' + err.message, true); }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+// maschera sequenziale: un cliente alla volta, chiede l'orario di ciascun bilico.
+function avviaCodaMaschereBilici(pezzi){
+  const perCliente = {};
+  pezzi.forEach(r => {
+    const nomeBase = r.cliente.replace(/\s*\(bilico \d+\/\d+\)\s*$/,'');
+    (perCliente[nomeBase] = perCliente[nomeBase] || []).push(r);
+  });
+  mostraProssimaMaschera(Object.entries(perCliente).map(([nome, pezzi]) => ({ nome, pezzi })));
+}
+function mostraProssimaMaschera(coda){
+  if(coda.length === 0) return;
+  const item = coda[0], resto = coda.slice(1);
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal-card">
+      <h3 style="margin-top:0;">${escapeHtml(item.nome)} — ${item.pezzi.length} bilici</h3>
+      <div class="status-line" style="margin-bottom:12px;">Inserisci pronto-dalle/entro-le per ciascuno, poi premi Conferma. Se salti, restano "in attesa" finché non li imposti a mano nella scheda Ritiri.</div>
+      ${item.pezzi.map((p,i)=>`
+        <div class="row" style="margin-bottom:8px;">
+          <div class="field"><label>Bilico ${i+1} — Pronto dalle</label><input type="time" data-mi="${i}" data-mc="orario"></div>
+          <div class="field"><label>Entro le</label><input type="time" data-mi="${i}" data-mc="orarioEntro"></div>
+        </div>
+      `).join('')}
+      <div class="row" style="margin-top:8px;">
+        <button class="btn-ghost" id="maskSkipBtn" style="border:1px solid var(--border);">Salta per ora</button>
+        <button class="btn-ghost" id="maskConfirmBtn" style="border:1px solid var(--ok);color:var(--ok);">✓ Conferma e salva orari</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const chiudi = () => { overlay.remove(); mostraProssimaMaschera(resto); };
+  overlay.querySelector('#maskSkipBtn').addEventListener('click', chiudi);
+  overlay.querySelector('#maskConfirmBtn').addEventListener('click', ()=>{
+    let almenoUno = false;
+    item.pezzi.forEach((p,i)=>{
+      const rOrario = overlay.querySelector(`[data-mi="${i}"][data-mc="orario"]`).value;
+      const rEntro = overlay.querySelector(`[data-mi="${i}"][data-mc="orarioEntro"]`).value;
+      const ritiro = ritiri.find(x=>x.id===p.id);
+      if(ritiro && rOrario){ ritiro.orario = rOrario; ritiro.orarioEntro = rEntro; ritiro.bisognaOrario = false; almenoUno = true; }
+    });
+    salva();
+    renderRitiri();      // aggiorna SUBITO l'etichetta rossa "in attesa" -> normale
+    renderTabellone();   // fa comparire subito i pezzi programmati tra i "da assegnare"
+    if(!almenoUno) alert('Nessun orario inserito: i bilici restano in attesa. Puoi impostarli più tardi dalla scheda Ritiri.');
+    chiudi();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// CAPACITÀ
+// ---------------------------------------------------------------------------
+// metri lineari effettivi: sempre calcolabili, è il vincolo fisico "vero" per
+// merce pallettizzata (spazio a terra) — a differenza del volume, che per i
+// bancali è solo una STIMA usata per il riepilogo, non un limite fisico affidabile
+function effectiveML(r, capacitaM3, capacitaLineareM, mlPerBancale){
+  if(r.metriLineari && r.metriLineari > 0) return r.metriLineari;
+  if(r.bancaliStandard && r.bancaliStandard > 0) return r.bancaliStandard * mlPerBancale;
+  return (r.quantita||0) / (capacitaM3/capacitaLineareM);
+}
+
+// ---------------------------------------------------------------------------
+// SEGMENTAZIONE IN GIRI
+// ---------------------------------------------------------------------------
+function costruisciGiriDriver(ritiriOrdinati, durMin, partenzaMinimaAssoluta, tempoSostaMin, maxAttesaMin){
+  const giri = [];
+  let i = 0;
+  let prossimaPartenzaMinima = partenzaMinimaAssoluta;
+
+  while(i < ritiriOrdinati.length){
+    const primo = ritiriOrdinati[i];
+    const travelDep = durMin[0][primo._matIdx];
+    const readyPrimo = toMinutes(primo.orario);
+    let partenza = prossimaPartenzaMinima;
+    if(readyPrimo !== null) partenza = Math.max(partenza, readyPrimo - travelDep);
+
+    let cursor = partenza + travelDep, waited0 = false;
+    if(readyPrimo !== null && cursor < readyPrimo){ cursor = readyPrimo; waited0 = true; }
+    const stops = [{ ritiro: primo, arrivo: fmtClock(cursor), waited: waited0, late:false }];
+    cursor += tempoSostaMin;
+    let prevMat = primo._matIdx;
+    i++;
+
+    while(i < ritiriOrdinati.length){
+      const next = ritiriOrdinati[i];
+      const arrivoDiretto = cursor + durMin[prevMat][next._matIdx];
+      const readyNext = toMinutes(next.orario);
+      if(readyNext !== null && arrivoDiretto < readyNext){
+        if((readyNext - arrivoDiretto) > maxAttesaMin) break;
+      }
+      cursor = arrivoDiretto;
+      let waited = false;
+      if(readyNext !== null && cursor < readyNext){ cursor = readyNext; waited = true; }
+      stops.push({ ritiro: next, arrivo: fmtClock(cursor), waited, late:false });
+      cursor += tempoSostaMin;
+      prevMat = next._matIdx;
+      i++;
+    }
+
+    const rientro = cursor + durMin[prevMat][0];
+    giri.push({ partenzaMin: partenza, partenzaTesto: fmtClock(partenza), stops, rientroMin: rientro, rientroTesto: fmtClock(rientro) });
+    prossimaPartenzaMinima = rientro;
+  }
+  return giri;
+}
+
+// ---------------------------------------------------------------------------
+// TABELLONE — rendering
+// ---------------------------------------------------------------------------
+function ritiriNonAssegnati(){
+  const idConfermati = idsRitiriConfermati();
+  return ritiri.filter(r => !r.assegnaA && !r.bisognaOrario && !idConfermati.has(String(r.id)));
+}
+
+// suggerimento di abbinamento: tra i ritiri NON assegnati, quali sono geograficamente
+// vicini (linea d'aria, è solo un suggerimento) e potrebbero stare sullo stesso giro.
+// La verifica VERA (orari, capacità reale) resta quella di tentaAssegnazione.
+function trovaAbbinabili(ritiro, tuttiGliAltri){
+  if(!ritiro.lat) return [];
+  const SOGLIA_KM = 20;
+  return tuttiGliAltri
+    .filter(r => r.id !== ritiro.id && r.lat)
+    .map(r => ({ ritiro:r, km: haversineKm(ritiro.lat, ritiro.lng, r.lat, r.lng) }))
+    .filter(x => x.km <= SOGLIA_KM)
+    .sort((a,b)=> a.km-b.km)
+    .slice(0,3);
+}
+
+function renderRitiriTabellone(){
+  const lista = ritiriNonAssegnati();
+  $('tabelloneRitiri').innerHTML = `<div class="tab-col-head">Da assegnare (${lista.length})</div>` + lista.map(r => {
+    const abbinabili = trovaAbbinabili(r, lista);
+    return `
+    <div class="tab-ritiro-card ${ritiroSelezionatoId===r.id?'selezionato':''}" data-tab-ritiro="${r.id}">
+      <div class="tab-ritiro-cliente">${escapeHtml(r.cliente)}</div>
+      <div class="tab-ritiro-meta">${r.quantita.toFixed(1)}m³${r.biliciRichiesti?` · ${r.biliciRichiesti} bilici`:''} · ${r.orario||'—'}–${r.orarioEntro||'—'}</div>
+      ${!r.lat && r._geoFallita ? `<div class="tab-ritiro-warn">⚠ indirizzo non trovato</div>` : ''}
+      ${abbinabili.length ? `<div class="tab-ritiro-abbina">🔗 vicino a: ${abbinabili.map(a=>`${escapeHtml(a.ritiro.cliente)} (${a.km.toFixed(0)}km)`).join(', ')}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+function renderDriversTabellone(){
+  $('tabelloneDrivers').innerHTML = flotta.map(d => {
+    const cache = d._routeCache || { giri: [], statoTesto: `libero dalle ${d.orarioPartenza}` };
+    return `
+    <div class="tab-driver-col ${ritiroSelezionatoId?'selezionabile':''}" data-tab-driver="${d.id}" title="${ritiroSelezionatoId?'Clicca per assegnare qui':''}">
+      <div class="tab-driver-head">${escapeHtml(d.nome||'(senza nome)')}</div>
+      <div class="tab-driver-stato">${cache.statoTesto}</div>
+      ${cache.giri.map((g,gi)=>`
+        <div class="tab-giro-block">
+          <div class="tab-giro-label">
+            <span>Giro ${gi+1} — ${g.partenzaTesto}→${g.rientroTesto}</span>
+            <span class="tab-giro-conferma" data-conferma-driver="${d.id}" data-conferma-giro="${gi}" title="Blocca questo giro: sparisce da qui e va tra i confermati">✓ conferma</span>
+          </div>
+          ${g.stops.map((s,i)=>`
+            <div class="tab-stop-card ${s.late?'late':''}" data-tab-unassign="${s.ritiro.id}" title="Clicca per togliere">
+              <span class="tab-stop-idx">${i+1}</span>
+              <span class="tab-stop-cliente">${escapeHtml(s.ritiro.cliente)}</span>
+              <span class="tab-stop-arrivo">${s.arrivo}${s.late?' ⚠':(s.waited?' ⏳':'')}</span>
+            </div>
+          `).join('')}
+        </div>
+      `).join('')}
+    </div>`;
+  }).join('');
+}
+function renderTabellone(){ renderRitiriTabellone(); renderDriversTabellone(); }
+
+function renderConfermati(){
+  $('confermatiCount').textContent = `(${giriConfermati.length})`;
+  if(giriConfermati.length === 0){ $('confermatiList').innerHTML = `<div class="empty-hint">nessun giro confermato ancora</div>`; return; }
+  $('confermatiList').innerHTML = giriConfermati.map(g => `
+    <div style="padding:6px 0;border-bottom:1px solid var(--border-soft);">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="flex:1;font-size:11.5px;"><b>${escapeHtml(g.nome)}</b> — ${fmtClock(g.partenzaMin)}-${fmtClock(g.partenzaMin+g.minuti)}</span>
+        <button class="btn-danger" data-annulla-conferma="${g.idConferma}" title="Annulla conferma">×</button>
+      </div>
+      <div style="font-size:10.5px;color:var(--text-muted);margin-top:2px;">${g.stops.map(s=>escapeHtml(s.ritiro.cliente)).join(', ')}</div>
+    </div>
+  `).join('');
+  $('confermatiList').querySelectorAll('[data-annulla-conferma]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      if(!confirm('Annullare la conferma? I ritiri torneranno tra i "da assegnare".')) return;
+      const g = giriConfermati.find(x=>x.idConferma===parseInt(btn.dataset.annullaConferma));
+      if(g){
+        // libera davvero i ritiri: tornano nel pool non assegnato, non restano
+        // agganciati al driver in uno stato limbo
+        g.ritiriIds.forEach(rid=>{
+          const r = ritiri.find(x=>String(x.id)===String(rid));
+          if(r) r.assegnaA = null;
+        });
+      }
+      giriConfermati = giriConfermati.filter(x=>x.idConferma!==parseInt(btn.dataset.annullaConferma));
+      salva();
+      ricalcolaTuttoLoStato();
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// RICALCOLO DI UN DRIVER — SOLO i ritiri non ancora confermati entrano qui
+// ---------------------------------------------------------------------------
+async function ricalcolaColonnaDriver(driver){
+  const idConfermati = idsRitiriConfermati();
+  const suoiRitiri = ritiri.filter(r => r.assegnaA === driver.id && r.lat && !idConfermati.has(String(r.id)));
+  if(suoiRitiri.length === 0){
+    driver._routeCache = { giri: [], statoTesto: `libero dalle ${driver.orarioPartenza}` };
+    return;
+  }
+  if(!deposito.lat){ driver._routeCache = { giri: [], statoTesto: 'geolocalizza il deposito prima' }; return; }
+
+  let table;
+  try{ table = await osrmTable([[deposito.lat,deposito.lng], ...suoiRitiri.map(r=>[r.lat,r.lng])]); }
+  catch(e){ driver._routeCache = { giri: [], statoTesto: 'errore di calcolo distanze' }; return; }
+  const durMin = table.durations.map(row=>row.map(v=>v/60));
+
+  const tempoSostaMin = parseFloat($('tempoSosta').value) || CONFIG.defaults.tempoSostaMin;
+  const tolleranzaMin = parseFloat($('tolleranzaRitardo').value) || CONFIG.defaults.tolleranzaRitardoMin;
+  const fineTurnoMin = toMinutes($('fineTurno').value) || toMinutes(CONFIG.defaults.fineTurno);
+  const maxAttesaMin = parseFloat($('maxAttesaMin').value) || CONFIG.defaults.maxAttesaMin;
+
+  const suoiGiriConfermati = giriConfermati.filter(g => g.flottaId === driver.id);
+  const partenzaBase = suoiGiriConfermati.length
+    ? Math.max(...suoiGiriConfermati.map(g=>g.partenzaMin+g.minuti))
+    : toMinutes(driver.orarioPartenza);
+
+  const ordinati = suoiRitiri
+    .map((r,i)=>({ ...r, _matIdx: i+1 }))
+    .sort((a,b)=> toMinutes(a.orarioEntro||a.orario||'23:59') - toMinutes(b.orarioEntro||b.orario||'23:59'));
+
+  const giri = costruisciGiriDriver(ordinati, durMin, partenzaBase, tempoSostaMin, maxAttesaMin);
+  giri.forEach(g => g.stops.forEach(s=>{
+    const deadline = (toMinutes(s.ritiro.orarioEntro) !== null) ? toMinutes(s.ritiro.orarioEntro) : fineTurnoMin;
+    s.late = toMinutes(s.arrivo) > deadline + tolleranzaMin;
+  }));
+
+  const ultimoRientro = giri.length ? giri[giri.length-1].rientroTesto : driver.orarioPartenza;
+  driver._routeCache = {
+    giri,
+    statoTesto: giri.length ? `${giri.length} giro/i attivi · libero dalle ${ultimoRientro}` : `libero dalle ${driver.orarioPartenza}`
+  };
+}
+
+// ---------------------------------------------------------------------------
+// TENTATIVO DI ASSEGNAZIONE
+// ---------------------------------------------------------------------------
+async function tentaAssegnazione(ritiroId, driverId){
+  const ritiro = ritiri.find(r=>r.id===ritiroId);
+  const driver = flotta.find(f=>f.id===driverId);
+  if(!ritiro || !driver) return;
+
+  setStatus(`Verifico ${ritiro.cliente} su ${driver.nome||'mezzo'}...`, false);
+
+  if(!deposito.lat){
+    deposito.via = $('depositoVia').value.trim();
+    deposito.cap = $('depositoCap').value.trim();
+    deposito.citta = $('depositoCitta').value.trim();
+    if(!deposito.cap && !deposito.citta){ alert('Inserisci almeno CAP o città del deposito.'); return; }
+    try{
+      const g = await geocodeMultilivello({ via: deposito.via, cap: deposito.cap, citta: deposito.citta });
+      deposito.lat=g.lat; deposito.lng=g.lng;
+      setStatus(`deposito geolocalizzato${g.precisione==='approssimato'?' (approssimato)':' ✓'}`, g.precisione==='approssimato');
+    }catch(e){ alert('Impossibile geolocalizzare il deposito: '+e.message); return; }
+  }
+  if(!ritiro.lat){
+    try{
+      const g = await geocodeMultilivello({ via: ritiro.indirizzo, cap: ritiro.cap, citta: ritiro.localita });
+      ritiro.lat=g.lat; ritiro.lng=g.lng; ritiro.approssimato = g.precisione==='approssimato'; ritiro.cittaSospetta = g.cittaSospetta;
+    }catch(e){ ritiro._geoFallita = true; renderTabellone(); alert('Impossibile geolocalizzare '+ritiro.cliente+': '+e.message); return; }
+  }
+  const idConfermati = idsRitiriConfermati();
+  const suoiEsistenti = ritiri.filter(r => r.assegnaA === driverId && !idConfermati.has(String(r.id)));
+  for(const r of suoiEsistenti){
+    if(!r.lat){
+      try{
+        const g = await geocodeMultilivello({ via: r.indirizzo, cap: r.cap, citta: r.localita });
+        r.lat=g.lat; r.lng=g.lng; r.approssimato = g.precisione==='approssimato';
+      }catch(e){ /* resta senza coordinate */ }
+    }
+  }
+  salva();
+
+  const esistentiValidi = suoiEsistenti.filter(r=>r.lat);
+  let table;
+  try{ table = await osrmTable([[deposito.lat,deposito.lng], ...esistentiValidi.map(r=>[r.lat,r.lng]), [ritiro.lat, ritiro.lng]]); }
+  catch(e){ alert('Errore di calcolo distanze: '+e.message); return; }
+  const durMin = table.durations.map(row=>row.map(v=>v/60));
+
+  const capacitaM3 = parseFloat($('capacitaUtileM3').value) || CONFIG.defaults.capacitaUtileM3;
+  const capacitaLineareM = parseFloat($('capacitaLineareM').value) || CONFIG.defaults.capacitaLineareM;
+  const mlPerBancale = parseFloat($('metriLineariPerBancale').value) || CONFIG.defaults.metriLineariPerBancale;
+  const tempoSostaMin = parseFloat($('tempoSosta').value) || CONFIG.defaults.tempoSostaMin;
+  const tolleranzaMin = parseFloat($('tolleranzaRitardo').value) || CONFIG.defaults.tolleranzaRitardoMin;
+  const fineTurnoMin = toMinutes($('fineTurno').value) || toMinutes(CONFIG.defaults.fineTurno);
+  const maxAttesaMin = parseFloat($('maxAttesaMin').value) || CONFIG.defaults.maxAttesaMin;
+
+  const suoiGiriConfermati = giriConfermati.filter(g => g.flottaId === driverId);
+  const partenzaBase = suoiGiriConfermati.length
+    ? Math.max(...suoiGiriConfermati.map(g=>g.partenzaMin+g.minuti))
+    : toMinutes(driver.orarioPartenza);
+
+  const ordinatiConCandidato = [...esistentiValidi, ritiro]
+    .map(r => ({ ...r, _matIdx: esistentiValidi.includes(r) ? esistentiValidi.indexOf(r)+1 : esistentiValidi.length+1 }))
+    .sort((a,b)=> toMinutes(a.orarioEntro||a.orario||'23:59') - toMinutes(b.orarioEntro||b.orario||'23:59'));
+
+  const giri = costruisciGiriDriver(ordinatiConCandidato, durMin, partenzaBase, tempoSostaMin, maxAttesaMin);
+  const giroDelCandidato = giri.find(g => g.stops.some(s=>s.ritiro.id===ritiro.id));
+  const stopCandidato = giroDelCandidato.stops.find(s=>s.ritiro.id===ritiro.id);
+
+  // il volume DICHIARATO è un vincolo fisico vero; il volume stimato dai bancali no —
+  // per quello conta il pianale (ml), calibrato sul numero reale di posizioni pallet
+  const volumeDichiaratoGiro = giroDelCandidato.stops.reduce((s,x)=> s + (x.ritiro.volumeDichiarato ? (x.ritiro.quantita||0) : 0), 0);
+  const mlGiro = giroDelCandidato.stops.reduce((s,x)=> s+effectiveML(x.ritiro,capacitaM3,capacitaLineareM,mlPerBancale), 0);
+  if(volumeDichiaratoGiro > capacitaM3){
+    alert(`Non c'è spazio nel giro delle ${giroDelCandidato.partenzaTesto}: ${volumeDichiaratoGiro.toFixed(1)} m³ dichiarati supererebbero i ${capacitaM3} m³ del mezzo.`);
+    return;
+  }
+  if(mlGiro > capacitaLineareM){
+    alert(`Pianale pieno nel giro delle ${giroDelCandidato.partenzaTesto}: ${mlGiro.toFixed(1)} ml supererebbero i ${capacitaLineareM} ml disponibili.`);
+    return;
+  }
+  const deadlineCand = (toMinutes(ritiro.orarioEntro) !== null) ? toMinutes(ritiro.orarioEntro) : fineTurnoMin;
+  if(toMinutes(stopCandidato.arrivo) > deadlineCand + tolleranzaMin){
+    alert(`${ritiro.cliente} chiude alle ${ritiro.orarioEntro || 'fine turno ' + fmtClock(fineTurnoMin)}, ma in questo giro ${driver.nome||'il mezzo'} arriverebbe solo alle ${stopCandidato.arrivo}.`);
+    return;
+  }
+  if(driver.fineDisponibilita){
+    const limite = toMinutes(driver.fineDisponibilita);
+    const fineUltimoGiro = giri[giri.length-1].rientroMin;
+    if(fineUltimoGiro > limite){
+      if(!confirm(`${driver.nome||'Questo driver'} è disponibile solo fino alle ${driver.fineDisponibilita}, ma con questa assegnazione finirebbe alle ${fmtClock(fineUltimoGiro)}.\n\nAssegnare comunque?`)) return;
+    }
+  }
+
+  ritiro.assegnaA = driverId;
+  salva();
+  await ricalcolaColonnaDriver(driver);
+  ritiroSelezionatoId = null;
+  renderTabellone();
+  setStatus(`${ritiro.cliente} assegnato a ${driver.nome||'mezzo'}.`, false);
+}
+
+function togliAssegnazione(ritiroId){
+  const r = ritiri.find(x=>x.id===ritiroId);
+  if(!r) return;
+  const driverId = r.assegnaA;
+  r.assegnaA = null;
+  salva();
+  const driver = flotta.find(f=>f.id===driverId);
+  if(driver) ricalcolaColonnaDriver(driver).then(renderTabellone);
+  else renderTabellone();
+}
+
+function confermaGiroDriver(driverId, giroIndex){
+  const driver = flotta.find(f=>f.id===driverId);
+  if(!driver || !driver._routeCache) return;
+  const giro = driver._routeCache.giri[giroIndex];
+  if(!giro) return;
+  if(!confirm(`Confermare questo giro di ${driver.nome||'mezzo'} (${giro.stops.length} tappe: ${giro.stops.map(s=>s.ritiro.cliente).join(', ')})? Non verrà più toccato.`)) return;
+
+  giriConfermati.push({
+    idConferma: confermaIdSeq++, flottaId: driverId, nome: driver.nome||'mezzo',
+    stops: giro.stops, partenzaMin: giro.partenzaMin, minuti: giro.rientroMin - giro.partenzaMin,
+    endLat: deposito.lat, endLng: deposito.lng,
+    ritiriIds: giro.stops.map(s=>s.ritiro.id)
+  });
+  salva();
+  // il ricalcolo del driver ora esclude automaticamente questi ritiri (sono confermati):
+  // il "conferma" per lo STESSO giro non può più comparire, perché quel giro non esiste
+  // più tra quelli attivi — questo impedisce fisicamente il doppio click
+  ricalcolaTuttoLoStato();
+}
+
+// ---------------------------------------------------------------------------
+// RENDERING — flotta e ritiri (sidebar)
+// ---------------------------------------------------------------------------
+function renderFlotta(){
+  $('flottaCount').textContent = `(${flotta.length})`;
+  $('flottaList').innerHTML = flotta.map((m,i) => `
+    <div style="padding:6px 0;border-bottom:1px solid var(--border-soft);">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input type="text" data-mezzo-nome="${m.id}" value="${escapeHtml(m.nome||'')}" placeholder="Mezzo ${i+1} / autista" style="flex:1;">
+        <input type="time" data-mezzo-orario="${m.id}" value="${m.orarioPartenza}" style="width:90px;" title="Orario di partenza">
+        <button class="btn-danger" data-del-mezzo="${m.id}">×</button>
+      </div>
+      <div style="margin-top:4px;">
+        <input type="time" data-mezzo-finedisp="${m.id}" value="${m.fineDisponibilita||''}" style="width:90px;" title="Disponibile fino alle (vuoto = tutto il turno)">
+        <span style="font-size:10px;color:var(--text-dim);margin-left:6px;">disponibile fino alle (vuoto = tutto il turno)</span>
+      </div>
+    </div>
+  `).join('');
+  $('flottaList').querySelectorAll('[data-mezzo-nome]').forEach(inp=>{
+    inp.addEventListener('change', ()=>{
+      const m = flotta.find(x=>x.id===parseInt(inp.dataset.mezzoNome));
+      if(m){ m.nome = inp.value.trim(); salva(); renderTabellone(); }
+    });
+  });
+  $('flottaList').querySelectorAll('[data-mezzo-orario]').forEach(inp=>{
+    inp.addEventListener('change', ()=>{
+      const m = flotta.find(x=>x.id===parseInt(inp.dataset.mezzoOrario));
+      if(m){ m.orarioPartenza = inp.value; salva(); ricalcolaColonnaDriver(m).then(renderTabellone); }
+    });
+  });
+  $('flottaList').querySelectorAll('[data-mezzo-finedisp]').forEach(inp=>{
+    inp.addEventListener('change', ()=>{
+      const m = flotta.find(x=>x.id===parseInt(inp.dataset.mezzoFinedisp));
+      if(m){ m.fineDisponibilita = inp.value; salva(); }
+    });
+  });
+  $('flottaList').querySelectorAll('[data-del-mezzo]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      if(flotta.length<=1){ alert('Deve restare almeno un mezzo.'); return; }
+      const id = parseInt(btn.dataset.delMezzo);
+      if(ritiri.some(r=>r.assegnaA===id) && !confirm('Questo mezzo ha ritiri assegnati: verranno liberati. Continuare?')) return;
+      ritiri.forEach(r=>{ if(r.assegnaA===id) r.assegnaA=null; });
+      flotta = flotta.filter(m=>m.id!==id);
+      renderFlotta(); salva();
+      ricalcolaTuttoLoStato();
+    });
+  });
+}
+
+function renderRitiri(){
+  $('ritiriCount').textContent = `(${ritiri.length})`;
+  const scrollBox = $('ritiriScroll'), summary = $('fileSummary');
+  if(ritiri.length === 0){ scrollBox.style.display='none'; summary.style.display='none'; return; }
   summary.style.display = 'flex';
-  const totQty = ritiri.reduce((s,r)=>s+r.quantita,0);
-  $('fileSummaryText').textContent = `${ritiri.length} ritiri · ${totQty.toFixed(1)} m³ totali`;
+  $('fileSummaryText').textContent = `${ritiri.length} ritiri · ${ritiri.reduce((s,r)=>s+r.quantita,0).toFixed(1)} m³ totali`;
   scrollBox.style.display = 'block';
   scrollBox.innerHTML = ritiri.map(r => `
     <div class="ritiro-row">
       <div class="rtop">
-        <span class="${r.cittaSospetta ? 'geo-sospetta' : (r.lat ? (r.approssimato ? 'geo-approx' : 'geo-ok') : 'geo-pending')}"
-              title="${r.cittaSospetta ? 'città trovata diversa da quella dichiarata: '+(r.cittaTrovata||'?') : (r.approssimato?'geolocalizzato in modo approssimato':'')}">●</span>
+        <span class="${r.cittaSospetta?'geo-sospetta':(r.lat?(r.approssimato?'geo-approx':'geo-ok'):'geo-pending')}">●</span>
         <input type="text" data-rid="${r.id}" data-rfield="cliente" value="${escapeHtml(r.cliente)}" placeholder="Cliente">
         <button class="btn-danger" data-del="${r.id}">×</button>
       </div>
-      <div class="rrow">
-        <input type="text" data-rid="${r.id}" data-rfield="indirizzo" value="${escapeHtml(r.indirizzo)}" placeholder="Indirizzo">
-        <input type="text" class="rcap" data-rid="${r.id}" data-rfield="cap" value="${escapeHtml(r.cap||'')}" placeholder="CAP">
+      <div class="manual-toggle" data-toggle-ritiro="${r.id}" style="margin:2px 0 0 20px;${r.bisognaOrario?'color:var(--danger);text-decoration:none;':''}">
+        ${r.bisognaOrario ? '⏳ IN ATTESA DI ORARIO — click per impostare' : `${r.quantita.toFixed(1)}m³${r.biliciRichiesti?` · ${r.biliciRichiesti} bilici`:''} · ${r.orario||'—'}–${r.orarioEntro||'—'}${r.assegnaA ? ' · assegnato' : ''} · modifica`}
       </div>
-      <div class="rrow">
-        <input type="text" data-rid="${r.id}" data-rfield="localita" value="${escapeHtml(r.localita||'')}" placeholder="Località">
-        <input type="time" class="rtime" data-rid="${r.id}" data-rfield="orario" value="${r.orario||''}" title="Pronto dalle">
-        <input type="time" class="rtime" data-rid="${r.id}" data-rfield="orarioEntro" value="${r.orarioEntro||''}" title="Entro le">
-      </div>
-      <div class="rrow">
-        <input type="number" step="0.1" class="rqty" data-rid="${r.id}" data-rfield="quantita" value="${r.quantita}">
-        <input type="number" step="0.1" class="rqty" data-rid="${r.id}" data-rfield="metriLineari" value="${r.metriLineari||0}" title="Metri lineari (0 = non si applica)">
-        <span class="rmeta" style="align-self:center;">m³ / ml · dalle ${r.orario||'—'} entro ${r.orarioEntro||'—'}</span>
+      <div class="manual-form" id="ritiroDetail-${r.id}">
+        <div class="rrow">
+          <input type="text" data-rid="${r.id}" data-rfield="indirizzo" value="${escapeHtml(r.indirizzo)}" placeholder="Indirizzo">
+          <input type="text" class="rcap" data-rid="${r.id}" data-rfield="cap" value="${escapeHtml(r.cap||'')}" placeholder="CAP">
+        </div>
+        <div class="rrow">
+          <input type="text" data-rid="${r.id}" data-rfield="localita" value="${escapeHtml(r.localita||'')}" placeholder="Località">
+          <input type="time" class="rtime" data-rid="${r.id}" data-rfield="orario" value="${r.orario||''}" title="Pronto dalle">
+          <input type="time" class="rtime" data-rid="${r.id}" data-rfield="orarioEntro" value="${r.orarioEntro||''}" title="Entro le">
+        </div>
+        <div class="rrow">
+          <input type="number" step="0.1" class="rqty" data-rid="${r.id}" data-rfield="quantita" value="${r.quantita}">
+          <input type="number" step="0.1" class="rqty" data-rid="${r.id}" data-rfield="metriLineari" value="${r.metriLineari||0}" title="Metri lineari (0 = automatico)">
+          <input type="number" step="0.5" class="rqty" data-rid="${r.id}" data-rfield="biliciRichiesti" value="${r.biliciRichiesti||0}" title="Bilici dedicati">
+          <span class="rmeta" style="align-self:center;">m³ / ml / bilici</span>
+        </div>
+        ${r.bisognaOrario ? `<button class="btn-ghost" style="border:1px solid var(--ok);color:var(--ok);width:100%;" data-conferma-orario="${r.id}">✓ Conferma orario e sblocca</button>` : ''}
       </div>
     </div>
   `).join('');
+  scrollBox.querySelectorAll('[data-toggle-ritiro]').forEach(t=>{
+    t.addEventListener('click', ()=> $(`ritiroDetail-${t.dataset.toggleRitiro}`).classList.toggle('show'));
+  });
   scrollBox.querySelectorAll('[data-del]').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       ritiri = ritiri.filter(r => r.id !== parseInt(btn.dataset.del));
-      renderRitiri(); renderMarkersBase(); salva();
+      salva();
+      renderRitiri();
+      ricalcolaTuttoLoStato();
+    });
+  });
+  scrollBox.querySelectorAll('[data-conferma-orario]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const r = ritiri.find(x=>x.id===parseInt(btn.dataset.confermaOrario));
+      if(!r) return;
+      if(!r.orario && !r.orarioEntro){ alert('Imposta almeno un orario prima di confermare.'); return; }
+      r.bisognaOrario = false;
+      salva();
+      renderRitiri();
+      renderTabellone();
     });
   });
   scrollBox.querySelectorAll('[data-rfield]').forEach(inp=>{
@@ -591,479 +866,184 @@ function renderRitiri(){
       const r = ritiri.find(x=>x.id===parseInt(inp.dataset.rid));
       if(!r) return;
       const field = inp.dataset.rfield;
-      if(field === 'quantita' || field === 'metriLineari'){
+      let riaggiornaLista = false;
+      if(['quantita','metriLineari','biliciRichiesti'].includes(field)){
         const v = parseFloat(inp.value);
         r[field] = isNaN(v) ? 0 : v;
+        if(field === 'quantita' && v > 0) r.volumeDichiarato = true;
       } else {
         const val = inp.value.trim();
         const cambiaIndirizzo = ['indirizzo','cap','localita'].includes(field) && val !== (r[field]||'');
         r[field] = val;
-        if(cambiaIndirizzo){
-          // l'indirizzo non è più quello geolocalizzato: va ricalcolato alla prossima ottimizzazione
-          r.lat = null; r.lng = null; r.approssimato = false; r.cittaSospetta = false; r.cittaTrovata = null;
+        if((field === 'orario' || field === 'orarioEntro') && val && r.bisognaOrario){
+          // basta UN orario per sbloccare: se manca l'altro, resta comunque libero da assegnare
+          if(r.orario || r.orarioEntro){ r.bisognaOrario = false; riaggiornaLista = true; }
         }
+        if(cambiaIndirizzo){ r.lat=null; r.lng=null; r.approssimato=false; r.cittaSospetta=false; r._geoFallita=false; }
       }
       salva();
-      // aggiorna solo la riga toccata sulla mappa/riepilogo, senza ridisegnare tutta la lista
-      // (ridisegnarla perderebbe il focus mentre si sta ancora scrivendo)
-      $('fileSummaryText').textContent = `${ritiri.length} ritiri · ${ritiri.reduce((s,x)=>s+x.quantita,0).toFixed(1)} m³ totali`;
+      if(riaggiornaLista){ renderRitiri(); renderTabellone(); }
+      else $('fileSummaryText').textContent = `${ritiri.length} ritiri · ${ritiri.reduce((s,x)=>s+x.quantita,0).toFixed(1)} m³ totali`;
     });
   });
 }
 
-function renderFleetLegend(risultati, nonAssegnatiTutti){
-  const el = $('fleetLegend');
-  if(risultati.length===0 && nonAssegnatiTutti.length===0){
-    el.innerHTML = `<div class="legend-empty">Lancia un'ottimizzazione per vedere qui l'abbinamento clienti-mezzo.</div>`;
-    return;
-  }
-  let html = risultati.map(r => `
-    <div class="legend-block">
-      <div class="legend-head">
-        <span class="swatch" style="background:${r.colore}"></span>
-        <span class="lname">${escapeHtml(r.nome)}</span>
-        <span class="lmeta">${r.stops.length} clienti · ${r.km.toFixed(0)} km</span>
-      </div>
-      <div class="legend-chips">
-        ${r.stops.map(s => `<span class="legend-chip"><span class="dot" style="background:${r.colore}"></span>${escapeHtml(s.ritiro.cliente)}</span>`).join('')}
-      </div>
-    </div>
-  `).join('');
-
-  if(nonAssegnatiTutti.length){
-    html += `
-      <div class="legend-block">
-        <div class="legend-head">
-          <span class="swatch" style="background:var(--danger)"></span>
-          <span class="lname" style="color:var(--danger);">Non assegnati</span>
-          <span class="lmeta">${nonAssegnatiTutti.length}</span>
-        </div>
-        <div class="legend-chips">
-          ${nonAssegnatiTutti.map(r => `<span class="legend-chip unassigned">${escapeHtml(r.cliente)}</span>`).join('')}
-        </div>
-      </div>
-    `;
-  }
-  el.innerHTML = html;
-}
-
-function renderResults(risultati, nonGeolocalizzati, nonAssegnati, daVerificare, capacitaM3PerMezzo, capacitaLineareM){
-  const panel = $('resultsPanel');
-  const inner = $('resultsInner');
-  if(risultati.length===0 && nonGeolocalizzati.length===0 && nonAssegnati.length===0 && daVerificare.length===0){
-    panel.classList.remove('show'); return;
-  }
-  panel.classList.add('show');
-
-  let html = risultati.map(r => {
-    const pct = Math.min(100, Math.round((r.carico / capacitaM3PerMezzo) * 100));
-    const avvisi = [];
-    if(r.overLimit) avvisi.push(`⚠ giro di ${(r.minuti/60).toFixed(1)}h, oltre il limite impostato`);
-    if(r.numLate) avvisi.push(`⚠ ${r.numLate} tappa/e fuori orario`);
-    return `
-    <div class="vresult" data-vehicle-id="${r.flottaId}" style="${r.overLimit ? 'border-color:var(--danger)':''}">
-      <div class="vhead" draggable="true" data-drag-driver="${r.flottaId}" title="Trascina per scambiare il driver con un altro giro">
-        <span class="swatch" style="background:${r.colore}"></span>
-        <span class="vname">⋮⋮ ${escapeHtml(r.nome)}</span>
-      </div>
-      <div class="stats">
-        <span><b>${r.carico.toFixed(1)}</b> m³ · saturazione <b>${pct}%</b></span>
-        ${r.metriLineari>0 ? `<span><b>${r.metriLineari.toFixed(1)}</b> ml / ${capacitaLineareM.toFixed(1)}</span>` : ''}
-        <span><b>${r.km.toFixed(0)}</b> km</span>
-        <span><b>${Math.round(r.minuti)}</b> min</span>
-        <span><b>${r.stops.length}</b> tappe</span>
-      </div>
-      ${avvisi.length ? `<div style="color:var(--danger);font-size:11px;margin-bottom:8px;">${avvisi.join('<br>')}</div>` : ''}
-      <ul class="stoplist">
-        ${r.stops.map((s,i)=>`
-          <li style="flex-wrap:wrap;">
-            <span class="idx">${i+1}</span>
-            <span class="stime ${s.late?'late':''}" title="Orario stimato di arrivo del mezzo">
-              <span class="slabel">arrivo</span> ${s.arrivo}
-            </span>
-            <span class="sname" title="${escapeHtml(s.ritiro.indirizzo)}${s.ritiro.approssimato?' (geoloc. approssimata)':''}">${escapeHtml(s.ritiro.cliente)}${s.ritiro.approssimato?' ~':''}</span>
-            <span class="sqty">${s.ritiro.quantita.toFixed(1)}m³</span>
-            <span class="sreq-full">
-              ${s.waited ? `<span class="wait-badge" title="Il mezzo è arrivato prima che la merce fosse pronta e ha aspettato">⏳ in attesa</span>` : ''}
-              ${(s.ritiro.orario || s.ritiro.orarioEntro) ? `<span class="slabel">finestra cliente</span> ${s.ritiro.orario ? 'dalle '+s.ritiro.orario : 'sempre pronta'}${s.ritiro.orarioEntro ? ' — entro le '+s.ritiro.orarioEntro : ' — nessuna chiusura indicata'}` : `<span class="slabel">finestra cliente</span> nessuna indicata`}
-            </span>
-          </li>
-          <div class="stop-edit">
-            <input type="text" class="edit-indirizzo" data-edit-id="${s.ritiro.id}" data-edit-field="indirizzo" value="${escapeHtml(s.ritiro.indirizzo)}" placeholder="Indirizzo">
-            <input type="text" class="edit-cap" data-edit-id="${s.ritiro.id}" data-edit-field="cap" value="${escapeHtml(s.ritiro.cap||'')}" placeholder="CAP">
-            <input type="text" class="edit-localita" data-edit-id="${s.ritiro.id}" data-edit-field="localita" value="${escapeHtml(s.ritiro.localita||'')}" placeholder="Località">
-            <input type="number" step="0.1" class="edit-qty" data-edit-id="${s.ritiro.id}" data-edit-field="quantita" value="${s.ritiro.quantita}">
-            <span class="edit-unit">m³</span>
-            <input type="number" step="0.1" class="edit-qty" data-edit-id="${s.ritiro.id}" data-edit-field="metriLineari" value="${s.ritiro.metriLineari||0}" title="0 = calcolo automatico">
-            <span class="edit-unit">ml (0=auto)</span>
-          </div>
-        `).join('')}
-      </ul>
-      <div class="modal-recalc-wrap">
-        <button class="btn-primary" style="width:100%;" data-recalc-card>↻ Salva modifiche e ricalcola</button>
-      </div>
-    </div>
-  `;}).join('');
-
-  if(daVerificare.length){
-    html += `
-      <div class="vresult" style="border-color:var(--danger)">
-        <div class="vhead"><span class="vname" style="color:var(--danger)">DA VERIFICARE — CITTÀ SOSPETTA (${daVerificare.length})</span></div>
-        <ul class="stoplist">
-          ${daVerificare.map(r=>`<li><span class="sname">${escapeHtml(r.cliente)}: atteso "${escapeHtml(r.localita)}", trovato "${escapeHtml(r.cittaTrovata||'?')}"</span></li>`).join('')}
-        </ul>
-      </div>
-    `;
-  }
-  if(nonAssegnati.length){
-    html += `
-      <div class="vresult" data-vehicle-id="auto" style="border-color:var(--danger)">
-        <div class="vhead"><span class="vname" style="color:var(--danger)">NON ASSEGNABILI (${nonAssegnati.length})</span></div>
-        <ul class="stoplist">
-          ${nonAssegnati.map(r=>`<li><span class="sname">${escapeHtml(r.cliente)} — ${r.irraggiungibile ? `orario ${r.orario} irraggiungibile da solo dal deposito` : `${r.quantita.toFixed(1)} m³, orario ${r.orario||'—'}, nessun mezzo compatibile`}</span></li>`).join('')}
-        </ul>
-      </div>
-    `;
-  }
-  if(nonGeolocalizzati.length){
-    html += `
-      <div class="vresult" style="border-color:var(--danger)">
-        <div class="vhead"><span class="vname" style="color:var(--danger)">NON GEOLOCALIZZATI (${nonGeolocalizzati.length})</span></div>
-        <ul class="stoplist">
-          ${nonGeolocalizzati.map(r=>`<li><span class="sname">${escapeHtml(r.cliente)} — ${escapeHtml(r.indirizzo)} ${escapeHtml(r.cap||'')} ${escapeHtml(r.localita||'')}</span></li>`).join('')}
-        </ul>
-      </div>
-    `;
-  }
-  inner.innerHTML = html;
-}
-
 // ---------------------------------------------------------------------------
-// OTTIMIZZAZIONE END-TO-END
+// MAPPA — marker + tragitto reale (OSRM) per ogni giro attivo, colorati per driver
 // ---------------------------------------------------------------------------
-async function eseguiOttimizzazione(){
-  const btn = $('optimizeBtn');
-  try{
-
-    if(ritiri.length === 0){ setStatus('optStatus', 'Carica o aggiungi almeno un ritiro.', true); return; }
-    deposito.via = $('depositoVia').value.trim();
-    deposito.cap = $('depositoCap').value.trim();
-    deposito.citta = $('depositoCitta').value.trim();
-    if(!deposito.cap && !deposito.citta){ setStatus('optStatus', 'Inserisci almeno CAP o città del deposito.', true); return; }
-
-    btn.disabled = true;
-
-    if(!deposito.lat){
-      setStatus('optStatus', 'Geolocalizzazione deposito...', false);
-      const g = await geocodeMultilivello({ via: deposito.via, cap: deposito.cap, citta: deposito.citta });
-      deposito.lat=g.lat; deposito.lng=g.lng; deposito.geoDisplay=g.displayName;
-      const avviso = g.cittaSospetta ? ` ⚠ città trovata diversa da quella inserita: "${g.cittaTrovata}"` : '';
-      setStatus('depositoStatus', `geolocalizzato${g.precisione==='approssimato'?' (approssimato)':' ✓'} — ${g.displayName}${avviso}`, g.precisione==='approssimato' || g.cittaSospetta);
-      await sleep(CONFIG.geocoding.requestDelayMs);
-    }
-
-    const daGeocodificare = ritiri.filter(r => !r.lat);
-    let done = 0;
-    for(const r of daGeocodificare){
-      setStatus('optStatus', `Geolocalizzazione ${++done}/${daGeocodificare.length}: ${r.cliente}...`, false);
+async function renderMappa(){
+  if(!map) return;
+  markersLayer.clearLayers();
+  routeLinesLayer.clearLayers();
+  if(deposito.lat){
+    L.circleMarker([deposito.lat, deposito.lng], { radius:8, color:'#E8E6E0', weight:2, fillColor:'#14181C', fillOpacity:1 })
+      .bindTooltip('Deposito').addTo(markersLayer);
+  }
+  for(let vi=0; vi<flotta.length; vi++){
+    const d = flotta[vi];
+    const colore = CONFIG.palette[vi % CONFIG.palette.length];
+    const giri = (d._routeCache && d._routeCache.giri) || [];
+    for(const g of giri){
+      g.stops.forEach((s,i) => {
+        L.circleMarker([s.ritiro.lat, s.ritiro.lng], {
+          radius:7, color: s.late ? '#C75146' : '#14181C', weight: s.late?2.5:1.5, fillColor: colore, fillOpacity:1
+        }).bindTooltip(`${d.nome||'mezzo'} #${i+1}: ${s.ritiro.cliente} — arrivo ${s.arrivo}`).addTo(markersLayer);
+      });
+      // il tragitto è quello STRADALE REALE (OSRM), lo stesso usato per i calcoli di orario —
+      // qui lo disegniamo, non lo ricalcoliamo con criteri diversi
       try{
-        const g = await geocodeMultilivello({ via: r.indirizzo, cap: r.cap, citta: r.localita });
-        r.lat=g.lat; r.lng=g.lng; r.approssimato = g.precisione === 'approssimato';
-        r.geoDisplay = g.displayName; r.cittaTrovata = g.cittaTrovata; r.cittaSospetta = g.cittaSospetta;
-      }catch(e){
-        console.warn('geocoding fallito per', r.indirizzo, r.cap, r.localita);
-      }
-      renderRitiri();
-      await sleep(CONFIG.geocoding.requestDelayMs);
+        const coords = [[deposito.lat,deposito.lng], ...g.stops.map(s=>[s.ritiro.lat,s.ritiro.lng]), [deposito.lat,deposito.lng]];
+        const route = await osrmRoute(coords);
+        L.geoJSON(route.geometry, { style:{ color: colore, weight:3, opacity:0.7 } }).addTo(routeLinesLayer);
+      }catch(e){ /* disegno del tragitto opzionale, non blocca la mappa se fallisce */ }
     }
-    salva();
-    renderMarkersBase();
-
-    const ritiriValidi = ritiri.filter(r => r.lat);
-    const nonGeolocalizzati = ritiri.filter(r => !r.lat);
-    const daVerificare = ritiriValidi.filter(r => r.cittaSospetta);
-    if(ritiriValidi.length === 0){ setStatus('optStatus', 'Nessun indirizzo geolocalizzabile.', true); btn.disabled=false; return; }
-
-    setStatus('optStatus', 'Calcolo matrice distanze (OSRM)...', false);
-    const coords = [[deposito.lat, deposito.lng], ...ritiriValidi.map(r=>[r.lat,r.lng])];
-    const table = await osrmTable(coords);
-    const fullDur = table.durations, fullDist = table.distances; // secondi, metri
-    const durMin = fullDur.map(row => row.map(v => v/60));
-
-    setStatus('optStatus', 'Costruzione dei giri (capacità + orari)...', false);
-    const capacitaM3PerMezzo = parseFloat($('capacitaUtileM3').value) || CONFIG.defaults.capacitaUtileM3;
-    const capacitaLineareM = parseFloat($('capacitaLineareM').value) || CONFIG.defaults.capacitaLineareM;
-    const metriLineariPerBancale = parseFloat($('metriLineariPerBancale').value) || CONFIG.defaults.metriLineariPerBancale;
-    const tempoSostaMin = parseFloat($('tempoSosta').value) || CONFIG.defaults.tempoSostaMin;
-    const tolleranzaMin = parseFloat($('tolleranzaRitardo').value) || CONFIG.defaults.tolleranzaRitardoMin;
-    const maxGiroMin = (parseFloat($('maxGiroOre').value) || CONFIG.defaults.maxGiroOre) * 60;
-    const rientro = $('rientroDeposito').checked;
-
-    const { routes, nonAssegnati, irraggiungibili } = buildRoutesVRPTW(ritiriValidi, durMin, capacitaM3PerMezzo, capacitaLineareM, metriLineariPerBancale, flotta, tempoSostaMin, tolleranzaMin);
-
-    const risultati = [];
-    routesLayer.clearLayers();
-    markersLayer.clearLayers();
-    renderMarkersBase();
-
-    for(let vi=0; vi<routes.length; vi++){
-      const route = routes[vi];
-      if(route.stops.length === 0) continue;
-      const nomeMezzo = (flotta[vi] && flotta[vi].nome) ? flotta[vi].nome : `Mezzo ${vi+1}`;
-      setStatus('optStatus', `Ottimizzo percorso: ${nomeMezzo}...`, false);
-
-      const refinedStops = constrainedTwoOpt(route.stops, durMin, ritiriValidi, tempoSostaMin, route.partenzaMin, tolleranzaMin);
-      let order = [0, ...refinedStops];
-      if(rientro) order = [...order, 0];
-
-      const routeCoords = order.map(gi => gi===0 ? [deposito.lat, deposito.lng] : [ritiriValidi[gi-1].lat, ritiriValidi[gi-1].lng]);
-      let geomData = null;
-      try{ geomData = await osrmRoute(routeCoords); }catch(e){}
-
-      let cursorMin = route.partenzaMin;
-      const stopsWithTime = [];
-      for(let k=1;k<order.length;k++){
-        const gi = order[k];
-        if(gi === 0) break;
-        cursorMin += durMin[order[k-1]][gi];
-        const ritiroObj = ritiriValidi[gi-1];
-        const readyMin = toMinutes(ritiroObj.orario);
-        const deadlineMin = toMinutes(ritiroObj.orarioEntro);
-        let waited = false;
-        if(readyMin !== null && cursorMin < readyMin){ cursorMin = readyMin; waited = true; }
-        const arrivo = fmtClock(cursorMin);
-        let late = false;
-        if(deadlineMin !== null && cursorMin > deadlineMin + tolleranzaMin) late = true;
-        stopsWithTime.push({ ritiro: ritiroObj, arrivo, late, waited });
-        cursorMin += tempoSostaMin;
-      }
-
-      const totalDistM = geomData ? geomData.distance : routeLength(order, fullDist);
-      const totalDurSec = geomData ? geomData.duration : routeLength(order, fullDur);
-      const minutiTotali = totalDurSec/60 + (stopsWithTime.length*tempoSostaMin);
-
-      risultati.push({
-        nome: nomeMezzo, flottaId: flotta[vi].id, colore: CONFIG.palette[vi % CONFIG.palette.length],
-        stops: stopsWithTime, carico: route.carico, metriLineari: route.metriLineari,
-        km: totalDistM/1000, minuti: minutiTotali,
-        overLimit: minutiTotali > maxGiroMin,
-        numLate: stopsWithTime.filter(s=>s.late).length
-      });
-
-      if(geomData) L.geoJSON(geomData.geometry, { style:{ color: CONFIG.palette[vi % CONFIG.palette.length], weight:4, opacity:0.85 } }).addTo(routesLayer);
-      stopsWithTime.forEach((sw, idx)=>{
-        L.circleMarker([sw.ritiro.lat, sw.ritiro.lng], {
-          radius:8, color: sw.late ? '#C75146' : '#14181C', weight: sw.late?2.5:1.5,
-          fillColor: CONFIG.palette[vi % CONFIG.palette.length], fillOpacity:1
-        }).bindTooltip(`${idx+1}. ${sw.ritiro.cliente} — arrivo ${sw.arrivo}${sw.late?' ⚠ in ritardo':''}`).addTo(markersLayer);
-      });
-    }
-
-    if(deposito.lat){
-      L.circleMarker([deposito.lat, deposito.lng], { radius:8, color:'#E8E6E0', weight:2, fillColor:'#14181C', fillOpacity:1 })
-        .bindTooltip('Deposito').addTo(markersLayer);
-    }
-
-    const tuttiNonAssegnati = [...nonGeolocalizzati, ...nonAssegnati, ...irraggiungibili];
-    renderResults(risultati, nonGeolocalizzati, [...nonAssegnati, ...irraggiungibili.map(r=>({...r, irraggiungibile:true}))], daVerificare, capacitaM3PerMezzo, capacitaLineareM);
-    renderFleetLegend(risultati, tuttiNonAssegnati);
-
-    if(risultati.length){
-      const allCoords = risultati.flatMap(r => r.stops.map(s=>[s.ritiro.lat, s.ritiro.lng]));
-      allCoords.push([deposito.lat, deposito.lng]);
-      map.fitBounds(allCoords, { padding:[40,40] });
-    }
-
-    const problemi = [];
-    if(daVerificare.length) problemi.push(`${daVerificare.length} indirizzo/i con città sospetta`);
-    if(nonGeolocalizzati.length) problemi.push(`${nonGeolocalizzati.length} non geolocalizzabile/i`);
-    if(nonAssegnati.length) problemi.push(`${nonAssegnati.length} non assegnabile/i (capacità o orari incompatibili)`);
-    if(irraggiungibili.length) problemi.push(`${irraggiungibili.length} irraggiungibile/i entro l'orario richiesto già da solo dal deposito`);
-    const troppiLunghi = risultati.filter(r=>r.overLimit).length;
-    if(troppiLunghi) problemi.push(`${troppiLunghi} mezzo/i oltre il limite orario`);
-    const riepilogo = `Usati ${risultati.length} mezzi su ${flotta.length} disponibili.`;
-    setStatus('optStatus', problemi.length ? `${riepilogo} Avvisi: ${problemi.join('; ')}.` : `${riepilogo} Ottimizzazione completata.`, problemi.length>0);
-
-  }catch(err){
-    console.error(err);
-    setStatus('optStatus', 'Errore: ' + err.message, true);
-  }finally{
-    btn.disabled = false;
   }
+  ritiriNonAssegnati().forEach(r=>{
+    if(r.lat) L.circleMarker([r.lat, r.lng], { radius:5, color:'#5C6570', weight:1, fillColor:'#20272F', fillOpacity:1 })
+      .bindTooltip(`${r.cliente} (non assegnato)`).addTo(markersLayer);
+  });
 }
 
 // ---------------------------------------------------------------------------
-// EVENTI UI — collegati dopo il caricamento della config
+// EVENTI UI
 // ---------------------------------------------------------------------------
-function closeModal(){
-  document.querySelectorAll('.modal-overlay, .modal-close').forEach(el => el.remove());
-}
-function openCardModal(cardEl){
-  closeModal();
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  const clone = cardEl.cloneNode(true);
-  clone.classList.add('modal-card');
-  overlay.appendChild(clone);
-  overlay.addEventListener('click', (e)=>{ if(e.target===overlay) closeModal(); });
-  document.body.appendChild(overlay);
-  const closeBtn = document.createElement('button');
-  closeBtn.className = 'modal-close';
-  closeBtn.textContent = '×';
-  closeBtn.addEventListener('click', closeModal);
-  document.body.appendChild(closeBtn);
-  overlay.dataset.hasCloseBtn = 'true';
-}
-document.addEventListener('keydown', (e)=>{ if(e.key==='Escape') closeModal(); });
-
-// legge i campi modificati dentro una scheda (nel modale) e li riporta nello stato:
-// se indirizzo/CAP/Località cambiano, quel ritiro va ri-geolocalizzato da capo.
-function applyCardEdits(cardEl){
-  const touched = new Set();
-  cardEl.querySelectorAll('[data-edit-id]').forEach(inp=>{
-    const id = parseInt(inp.dataset.editId);
-    const field = inp.dataset.editField;
-    const r = ritiri.find(x=>x.id===id);
-    if(!r) return;
-    if(field === 'quantita' || field === 'metriLineari'){
-      const v = parseFloat(inp.value);
-      if(!isNaN(v)) r[field] = v;
-      return;
-    }
-    const val = inp.value.trim();
-    if(val !== (r[field]||'')){
-      r[field] = val;
-      touched.add(id);
-    }
+function wireUpTabs(){
+  document.querySelectorAll('.tab-btn').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+      btn.classList.add('active');
+      $(`tab${btn.dataset.tab.charAt(0).toUpperCase()+btn.dataset.tab.slice(1)}`).classList.add('active');
+    });
   });
-  touched.forEach(id=>{
-    const r = ritiri.find(x=>x.id===id);
-    if(r){ r.lat=null; r.lng=null; r.approssimato=false; r.cittaSospetta=false; r.cittaTrovata=null; }
+  document.querySelectorAll('.main-tab-btn').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      document.querySelectorAll('.main-tab-btn').forEach(b=>b.classList.remove('active'));
+      document.querySelectorAll('.main-tab-panel').forEach(p=>p.classList.remove('active'));
+      btn.classList.add('active');
+      document.querySelector(`.main-tab-panel[data-maintabpanel="${btn.dataset.maintab}"]`).classList.add('active');
+      if(btn.dataset.maintab === 'mappa'){ setTimeout(()=>{ map.invalidateSize(); renderMappa(); }, 50); }
+    });
   });
-  renderRitiri();
-  salva();
 }
 
 function wireUpUI(){
-  // deposito
+  wireUpTabs();
   ['depositoVia','depositoCap','depositoCitta'].forEach(id=>{
     $(id).addEventListener('change', ()=>{
       deposito.via = $('depositoVia').value.trim();
       deposito.cap = $('depositoCap').value.trim();
       deposito.citta = $('depositoCitta').value.trim();
       deposito.lat = null; deposito.lng = null;
-      setStatus('depositoStatus', "da geolocalizzare all'ottimizzazione", false);
+      setStatus("deposito da geolocalizzare (avviene alla prima assegnazione)", false);
       salva();
     });
   });
 
-  // import file
-  const dropzone = $('dropzone');
-  const fileInput = $('fileInput');
+  const dropzone = $('dropzone'), fileInput = $('fileInput');
   dropzone.addEventListener('click', ()=> fileInput.click());
   fileInput.addEventListener('change', (e)=>{ if(e.target.files[0]) handleFile(e.target.files[0]); fileInput.value=''; });
   ['dragover','dragenter'].forEach(evt => dropzone.addEventListener(evt, (e)=>{ e.preventDefault(); dropzone.classList.add('drag'); }));
   ['dragleave','drop'].forEach(evt => dropzone.addEventListener(evt, (e)=>{ e.preventDefault(); dropzone.classList.remove('drag'); }));
-  dropzone.addEventListener('drop', (e)=>{ const file = e.dataTransfer.files[0]; if(file) handleFile(file); });
+  dropzone.addEventListener('drop', (e)=>{ const f=e.dataTransfer.files[0]; if(f) handleFile(f); });
 
-  const dropzoneFlotta = $('dropzoneFlotta');
-  const fileInputFlotta = $('fileInputFlotta');
-  dropzoneFlotta.addEventListener('click', ()=> fileInputFlotta.click());
-  fileInputFlotta.addEventListener('change', (e)=>{ if(e.target.files[0]) handleFileFlotta(e.target.files[0]); fileInputFlotta.value=''; });
-  ['dragover','dragenter'].forEach(evt => dropzoneFlotta.addEventListener(evt, (e)=>{ e.preventDefault(); dropzoneFlotta.classList.add('drag'); }));
-  ['dragleave','drop'].forEach(evt => dropzoneFlotta.addEventListener(evt, (e)=>{ e.preventDefault(); dropzoneFlotta.classList.remove('drag'); }));
-  dropzoneFlotta.addEventListener('drop', (e)=>{ const file = e.dataTransfer.files[0]; if(file) handleFileFlotta(file); });
+  const dzFlotta = $('dropzoneFlotta'), fiFlotta = $('fileInputFlotta');
+  dzFlotta.addEventListener('click', ()=> fiFlotta.click());
+  fiFlotta.addEventListener('change', (e)=>{ if(e.target.files[0]) handleFileFlotta(e.target.files[0]); fiFlotta.value=''; });
+  ['dragover','dragenter'].forEach(evt => dzFlotta.addEventListener(evt, (e)=>{ e.preventDefault(); dzFlotta.classList.add('drag'); }));
+  ['dragleave','drop'].forEach(evt => dzFlotta.addEventListener(evt, (e)=>{ e.preventDefault(); dzFlotta.classList.remove('drag'); }));
+  dzFlotta.addEventListener('drop', (e)=>{ const f=e.dataTransfer.files[0]; if(f) handleFileFlotta(f); });
 
   $('clearRitiriBtn').addEventListener('click', ()=>{
-    if(confirm('Svuotare tutti i ritiri caricati?')){ ritiri = []; renderRitiri(); renderMarkersBase(); salva(); }
+    if(confirm('Svuotare tutti i ritiri? Anche i giri confermati che li contengono verranno rimossi.')){
+      ritiri = [];
+      salva();
+      renderRitiri();
+      ricalcolaTuttoLoStato(); // ripulisce anche eventuali giri confermati orfani
+    }
   });
 
-  // form manuale
   $('manualToggle').addEventListener('click', ()=> $('manualForm').classList.toggle('show'));
   $('addManualBtn').addEventListener('click', ()=>{
     const cliente = $('mCliente').value.trim();
     const indirizzo = $('mIndirizzo').value.trim();
-    const cap = $('mCap').value.trim();
-    const localita = $('mLocalita').value.trim();
-    const orario = $('mOrario').value;
-    const orarioEntro = $('mOrarioEntro').value;
-    const quantita = parseFloat($('mQuantita').value) || 0;
-    const metriLineari = parseFloat($('mMetriLineari').value) || 0;
     if(!cliente || !indirizzo){ alert('Compila almeno cliente e indirizzo.'); return; }
-    ritiri.push({ id: ritiroIdSeq++, cliente, indirizzo, cap, localita, orario, orarioEntro, quantita, metriLineari, lat:null, lng:null, approssimato:false });
-    ['mCliente','mIndirizzo','mCap','mLocalita','mOrario','mOrarioEntro','mQuantita','mMetriLineari'].forEach(id => $(id).value = '');
-    renderRitiri(); salva();
+    const biliciRichiesti = parseFloat($('mBiliciRichiesti').value) || 0;
+    const cap = $('mCap').value.trim(), localita = $('mLocalita').value.trim();
+    const orario = $('mOrario').value, orarioEntro = $('mOrarioEntro').value;
+    const quantitaInput = parseFloat($('mQuantita').value) || 0;
+    const metriLineari = parseFloat($('mMetriLineari').value) || 0;
+
+    const pezzi = contaPezzi(biliciRichiesti);
+    if(pezzi >= 2){
+      const interi = Math.floor(biliciRichiesti), fraz = biliciRichiesti - interi;
+      const nuovi = [];
+      for(let k=0;k<interi;k++) nuovi.push({ id: ritiroIdSeq++, cliente:`${cliente} (bilico ${k+1}/${pezzi})`, indirizzo, cap, localita,
+        orario:'', orarioEntro:'', quantita:0, volumeDichiarato:false, metriLineari:0, bancaliStandard:0, biliciRichiesti:1, bisognaOrario:true, assegnaA:null, lat:null, lng:null, approssimato:false });
+      if(fraz>1e-6) nuovi.push({ id: ritiroIdSeq++, cliente:`${cliente} (bilico ${pezzi}/${pezzi})`, indirizzo, cap, localita,
+        orario:'', orarioEntro:'', quantita:0, volumeDichiarato:false, metriLineari:0, bancaliStandard:0, biliciRichiesti:fraz, bisognaOrario:true, assegnaA:null, lat:null, lng:null, approssimato:false });
+      ritiri.push(...nuovi);
+      salva();
+      renderRitiri();
+      renderTabellone();
+      avviaCodaMaschereBilici(nuovi);
+    } else {
+      ritiri.push({ id: ritiroIdSeq++, cliente, indirizzo, cap, localita, orario, orarioEntro, quantita:quantitaInput, volumeDichiarato: quantitaInput>0, metriLineari,
+        bancaliStandard:0, biliciRichiesti, bisognaOrario:false, assegnaA:null, lat:null, lng:null, approssimato:false });
+      salva();
+      renderRitiri();
+      renderTabellone();
+    }
+    ['mCliente','mIndirizzo','mCap','mLocalita','mOrario','mOrarioEntro','mQuantita','mMetriLineari','mBiliciRichiesti'].forEach(id => $(id).value = '');
   });
 
   $('addMezzoBtn').addEventListener('click', ()=>{
     const ultimo = flotta[flotta.length-1];
-    flotta.push({ id: mezzoIdSeq++, orarioPartenza: ultimo ? ultimo.orarioPartenza : CONFIG.defaults.primoMezzoOrarioPartenza });
-    renderFlotta(); salva();
+    flotta.push({ id: mezzoIdSeq++, nome:'', orarioPartenza: ultimo?ultimo.orarioPartenza:CONFIG.defaults.primoMezzoOrarioPartenza, fineDisponibilita:'' });
+    renderFlotta(); renderTabellone(); salva();
   });
 
-  $('optimizeBtn').addEventListener('click', eseguiOttimizzazione);
-
-  $('resultsInner').addEventListener('click', (e)=>{
-    // il drag non deve aprire il modale: si apre solo cliccando fuori dalle righe trascinabili
-    if(e.target.closest('[data-drag-id]')) return;
-    const card = e.target.closest('.vresult');
-    if(card) openCardModal(card);
-  });
-
-  $('resultsInner').addEventListener('dragstart', (e)=>{
-    const head = e.target.closest('[data-drag-driver]');
-    if(!head) return;
-    e.dataTransfer.setData('application/x-driver-swap', head.dataset.dragDriver);
-    e.dataTransfer.effectAllowed = 'move';
-  });
-
-  $('resultsInner').addEventListener('dragover', (e)=>{
-    const card = e.target.closest('.vresult');
-    if(!card) return;
-    e.preventDefault();
-    card.classList.add('drag-over');
-  });
-  $('resultsInner').addEventListener('dragleave', (e)=>{
-    const card = e.target.closest('.vresult');
-    if(card) card.classList.remove('drag-over');
-  });
-  $('resultsInner').addEventListener('drop', (e)=>{
-    const card = e.target.closest('.vresult');
-    if(!card) return;
-    e.preventDefault();
-    card.classList.remove('drag-over');
-
-    const driverIdSorgente = e.dataTransfer.getData('application/x-driver-swap');
-    if(!driverIdSorgente) return;
-    const vehicleIdDest = card.dataset.vehicleId;
-    if(vehicleIdDest === 'auto') return; // non ha senso scambiare col riquadro "non assegnabili"
-    const idA = parseInt(driverIdSorgente), idB = parseInt(vehicleIdDest);
-    if(idA === idB) return;
-    const mezzoA = flotta.find(f=>f.id===idA), mezzoB = flotta.find(f=>f.id===idB);
-    if(!mezzoA || !mezzoB) return;
-    const tmp = mezzoA.nome;
-    mezzoA.nome = mezzoB.nome;
-    mezzoB.nome = tmp;
-    salva();
-    renderFlotta();
-    eseguiOttimizzazione();
-  });
-
-  // il pulsante "ricalcola" vive solo dentro il modale (clone della scheda)
   document.addEventListener('click', (e)=>{
-    const recalcBtn = e.target.closest('[data-recalc-card]');
-    if(recalcBtn){
-      const card = recalcBtn.closest('.vresult');
-      applyCardEdits(card);
-      closeModal();
-      eseguiOttimizzazione();
+    const confermaBtn = e.target.closest('[data-conferma-giro]');
+    if(confermaBtn){
+      confermaGiroDriver(parseInt(confermaBtn.dataset.confermaDriver), parseInt(confermaBtn.dataset.confermaGiro));
+      return;
+    }
+    const un = e.target.closest('[data-tab-unassign]');
+    if(un){ togliAssegnazione(parseInt(un.dataset.tabUnassign)); return; }
+
+    const ritiroCard = e.target.closest('[data-tab-ritiro]');
+    if(ritiroCard){
+      const rid = parseInt(ritiroCard.dataset.tabRitiro);
+      ritiroSelezionatoId = (ritiroSelezionatoId===rid) ? null : rid;
+      renderTabellone();
+      return;
+    }
+    const driverCol = e.target.closest('[data-tab-driver]');
+    if(driverCol && ritiroSelezionatoId != null){
+      tentaAssegnazione(ritiroSelezionatoId, parseInt(driverCol.dataset.tabDriver));
     }
   });
-
-  // dentro il modale, i campi di modifica non devono chiudere il modale al click
-  document.addEventListener('click', (e)=>{
-    if(e.target.closest('.stop-edit') && e.target.closest('.modal-card')) e.stopPropagation();
-  }, true);
 }
 
 function applyDefaults(){
@@ -1074,8 +1054,15 @@ function applyDefaults(){
   $('volumeBancale').value = d.volumeBancalePerM3;
   $('tempoSosta').value = d.tempoSostaMin;
   $('tolleranzaRitardo').value = d.tolleranzaRitardoMin;
-  $('maxGiroOre').value = d.maxGiroOre;
-  $('rientroDeposito').checked = d.rientroDeposito;
+  $('fineTurno').value = d.fineTurno;
+  $('maxAttesaMin').value = d.maxAttesaMin;
+}
+
+function initMap(){
+  map = L.map('map', { zoomControl:true }).setView([CONFIG.defaults.mapCenter.lat, CONFIG.defaults.mapCenter.lng], CONFIG.defaults.mapZoom);
+  L.tileLayer(CONFIG.endpoints.osmTiles, { attribution:'&copy; OpenStreetMap contributors', maxZoom:18 }).addTo(map);
+  markersLayer = L.layerGroup().addTo(map);
+  routeLinesLayer = L.layerGroup().addTo(map);
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,5 +1073,8 @@ function applyDefaults(){
   applyDefaults();
   initMap();
   wireUpUI();
-  await carica();
+  carica();
+  renderFlotta();
+  renderRitiri();
+  await ricalcolaTuttoLoStato();
 })();
